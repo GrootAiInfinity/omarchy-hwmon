@@ -34,28 +34,17 @@ detailed system panel on click.
 ## Install
 
 ```sh
-git clone https://github.com/<you>/omarchy-hwmon.git
-cd omarchy-hwmon
-./install.sh
+git clone https://github.com/GrootAiInfinity/omarchy-hwmon.git && cd omarchy-hwmon && ./install.sh
 ```
 
-`install.sh` copies:
-
-| Repo path                | Installed to                                  |
-|--------------------------|-----------------------------------------------|
-| `bar/modules/hwmon.qml`  | `~/.config/omarchy/bar/modules/hwmon.qml`     |
-| `bar/scripts/hwmon.sh`   | `~/.config/omarchy/bar/scripts/hwmon.sh`      |
-
-Then add the widget to the bar layout in `~/.config/omarchy/shell.json` —
-inside `bar.layout` (e.g. at the end of `right`):
-
-```json
-{ "id": "hwmon", "type": "qml" }
-```
-
-Reload with `omarchy restart shell`.
+That one line does everything: copies `hwmon.qml` + `hwmon.sh` into
+`~/.config/omarchy/`, adds `{ "id": "hwmon", "type": "qml" }` to `bar.layout`
+in `shell.json` (backing it up first, idempotently), rewrites the hard-coded
+`$HOME` path, and runs `omarchy restart shell`. Requires `jq`.
 
 ### Optional: start expanded
+
+Edit the `hwmon` entry in `~/.config/omarchy/shell.json`:
 
 ```json
 { "id": "hwmon", "type": "qml", "expanded": true }

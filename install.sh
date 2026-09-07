@@ -1,23 +1,31 @@
 #!/usr/bin/env bash
-# Install the hwmon bar widget into ~/.config/omarchy.
+# Install AND enable the hwmon widget: copies the files, adds the widget to the
+# omarchy bar layout, and reloads the shell. Idempotent.
 set -euo pipefail
 
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-DEST="${OMARCHY_CONFIG:-$HOME/.config/omarchy}"
+CFG="${OMARCHY_CONFIG:-$HOME/.config/omarchy}"
+SHELL_JSON="$CFG/shell.json"
+ID="hwmon"
 
-install -Dm644 "$SRC/bar/modules/hwmon.qml" "$DEST/bar/modules/hwmon.qml"
-install -Dm755 "$SRC/bar/scripts/hwmon.sh" "$DEST/bar/scripts/hwmon.sh"
+command -v jq >/dev/null || { echo "error: jq is required" >&2; exit 1; }
 
-echo "Installed:"
-echo "  $DEST/bar/modules/hwmon.qml"
-echo "  $DEST/bar/scripts/hwmon.sh"
-echo
-echo "Next: add  { \"id\": \"hwmon\", \"type\": \"qml\" }  to bar.layout in"
-echo "  $DEST/shell.json"
-echo "then run:  omarchy restart shell"
+install -Dm644 "$SRC/bar/modules/$ID.qml" "$CFG/bar/modules/$ID.qml"
+install -Dm755 "$SRC/bar/scripts/$ID.sh" "$CFG/bar/scripts/$ID.sh"
+# point the widget at this machine's $HOME
+sed -i "s#/home/groot/#$HOME/#g" "$CFG/bar/modules/$ID.qml"
 
-if [ "$USER" != "groot" ]; then
-  echo
-  echo "NOTE: your username is '$USER', not 'groot'. Edit the 'script' and"
-  echo "'stateFile' properties near the top of hwmon.qml to match your \$HOME."
-fi
+cp "$SHELL_JSON" "$SHELL_JSON.bak.$(date +%s)"
+tmp="$(mktemp)"
+jq --arg id "$ID" '
+  ({id:$id, type:"qml"}) as $entry
+  | if (.bar.layout | type) == "object"
+    then .bar.layout.right = ((.bar.layout.right // [])
+         | if any(.[]?; .id == $id) then . else . + [$entry] end)
+    else .bar.layout = ((.bar.layout // [])
+         | if any(.[]?; .id == $id) then . else . + [$entry] end)
+    end
+' "$SHELL_JSON" > "$tmp" && mv "$tmp" "$SHELL_JSON"
+
+omarchy restart shell 2>/dev/null || true
+echo "hwmon installed and enabled. If the bar didn't refresh: omarchy restart shell"
