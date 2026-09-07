@@ -12,11 +12,17 @@ import qs.Commons
 // Backend: ~/.config/omarchy/bar/scripts/hwmon.sh
 Panel {
   id: root
-  moduleName: "custom.hwmon"
-  ipcTarget: "custom.hwmon"
+  moduleName: "groot.hwmon"
+  ipcTarget: "groot.hwmon"
 
-  readonly property string script: "/home/groot/.config/omarchy/bar/scripts/hwmon.sh"
-  readonly property string stateFile: "/home/groot/.config/omarchy/bar/scripts/.hwmon-expanded"
+  // Resolve the bundled backend script relative to this plugin's own folder,
+  // wherever `omarchy plugin add` installed it.
+  readonly property string pluginDir: {
+    var dir = String(Qt.resolvedUrl("."))
+    return dir.replace(/^file:\/\//, "").replace(/\/$/, "")
+  }
+  readonly property string script: pluginDir + "/hwmon.sh"
+  readonly property string stateFile: (Quickshell.env("XDG_STATE_HOME") || (Quickshell.env("HOME") + "/.local/state")) + "/omarchy-hwmon.expanded"
 
   property var stats: ({})
   property bool expanded: setting("expanded", false)
@@ -96,7 +102,7 @@ Panel {
 
   function setExpanded(v) {
     root.expanded = v
-    writeStateProc.command = ["bash", "-c", "printf '%s' " + (v ? "1" : "0") + " > '" + root.stateFile + "'"]
+    writeStateProc.command = ["bash", "-c", "mkdir -p \"$(dirname '" + root.stateFile + "')\" && printf '%s' " + (v ? "1" : "0") + " > '" + root.stateFile + "'"]
     if (!writeStateProc.running) writeStateProc.running = true
   }
 

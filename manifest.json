@@ -1,0 +1,36 @@
+{
+  "$schema": "https://raw.githubusercontent.com/omarchy/omarchy/main/schemas/plugin.json",
+  "schemaVersion": 1,
+  "id": "groot.hwmon",
+  "name": "Hardware Monitor",
+  "version": "1.0.0",
+  "author": "groot",
+  "license": "MIT",
+  "description": "Live CPU / temperature readout in the bar; click for a detailed system panel (CPU cores, memory, thermals, GPUs, disks, network, top processes, battery).",
+  "repository": "https://github.com/GrootAiInfinity/omarchy-hwmon",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "hwmon.qml"
+  },
+  "barWidget": {
+    "displayName": "Hardware Monitor",
+    "description": "CPU% + temperature in the bar. Right-click / scroll expands it to add memory, GPU and battery; left-click opens the full system panel.",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "expanded": false
+    },
+    "schema": [
+      {
+        "key": "expanded",
+        "type": "boolean",
+        "label": "Start expanded",
+        "defaultValue": false,
+        "description": "Show the memory / GPU / battery readouts in the bar too (also toggled at runtime with right-click or scroll)."
+      }
+    ]
+  }
+}
