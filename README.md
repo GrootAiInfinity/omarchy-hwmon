@@ -15,8 +15,9 @@ detailed system panel on click.
   - CPU usage, frequency, load average, and a per-core bar grid
   - Memory and swap
   - Thermals and fan speeds
-  - Per-GPU utilisation meters — AMD iGPU via `gpu_busy_percent` sysfs,
-    NVIDIA via `nvidia-smi`
+  - Per-GPU utilisation meters, each labelled with its model name (e.g.
+    `Radeon Vega Series`, `GeForce RTX 2060`) — AMD iGPU via `gpu_busy_percent`
+    sysfs, NVIDIA via `nvidia-smi`
   - Disk usage per mount
   - Live network throughput per interface
   - Top processes by CPU and by RAM
@@ -29,7 +30,8 @@ detailed system panel on click.
 
 - Omarchy shell (Quickshell-based bar)
 - `jq`, `lm_sensors` (`sensors`), coreutils (`free`, `df`, `nproc`, `ps`)
-- Optional: `nvidia-smi` for NVIDIA GPU stats
+- Optional: `nvidia-smi` for NVIDIA GPU stats; `pciutils` (`lspci`) for GPU
+  model names
 
 ## Install
 
@@ -63,6 +65,9 @@ then set `expanded` on the `groot.hwmon` entry in `~/.config/omarchy/shell.json`
 - GPU coverage: AMD and Intel utilisation via the `gpu_busy_percent` DRM sysfs
   counter (temp via `lm_sensors`); NVIDIA via `nvidia-smi` (panel-open only).
   A GPU with no `gpu_busy_percent` and no `nvidia-smi` shows no utilisation.
+- GPU model names come from `lspci` (marketing name in `[brackets]`, first
+  variant of an `A / B` pair) and `nvidia-smi --query-gpu=name`; without
+  `lspci` the meter falls back to the bare vendor label.
 - `omarchy update` / `omarchy refresh shell` rewrites `shell.json` and drops the
   `hwmon` layout entry (the widget files survive). Re-run
   `omarchy plugin enable groot.hwmon` and `omarchy restart shell`.

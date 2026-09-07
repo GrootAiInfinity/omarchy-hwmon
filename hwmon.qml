@@ -49,7 +49,7 @@ Panel {
     lines.push("RAM  " + memPct + "%  ·  " + fmt1(stats.mem_used_gib) + " / " + fmt1(stats.mem_total_gib) + " GiB")
     if (tempC !== null) lines.push((stats.temp_label || "TEMP") + "  " + tempC + "°C")
     for (var i = 0; i < gpus.length; i++)
-      lines.push(gpus[i].name + "  " + Math.round(gpus[i].util) + "%"
+      lines.push((gpus[i].model || gpus[i].name) + "  " + Math.round(gpus[i].util) + "%"
                  + (gpus[i].temp !== null && gpus[i].temp !== undefined ? "  ·  " + Math.round(gpus[i].temp) + "°C" : ""))
     if (battery) lines.push("BAT  " + battery.pct + "%  " + battery.status)
     if (stats.uptime) lines.push("up " + stats.uptime)
@@ -349,7 +349,7 @@ Panel {
               Chip {
                 required property var modelData
                 visible: modelData.temp !== null && modelData.temp !== undefined
-                text: modelData.name + "  " + Math.round(modelData.temp) + "°C"
+                text: (modelData.model || modelData.name) + "  " + Math.round(modelData.temp) + "°C"
                 warnColor: Number(modelData.temp) >= 85
               }
             }
@@ -382,8 +382,9 @@ Panel {
                   width: gpuCol.width
                   spacing: Style.space(4)
                   SectionHead {
-                    title: modelData.name
-                    detail: Math.round(Number(modelData.util) || 0) + "%"
+                    title: modelData.model || modelData.name
+                    detail: (modelData.model ? modelData.name + "   ·   " : "")
+                            + Math.round(Number(modelData.util) || 0) + "%"
                             + (modelData.mem_pct !== null && modelData.mem_pct !== undefined
                                ? "   ·   VRAM " + Math.round(modelData.mem_pct) + "%" : "")
                             + (modelData.temp !== null && modelData.temp !== undefined

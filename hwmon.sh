@@ -19,6 +19,21 @@ FULL=0
 
 have() { command -v "$1" >/dev/null 2>&1; }
 
+# Human-friendly GPU model name for a PCI address (e.g. 0000:06:00.0), via
+# lspci: "Renoir [Radeon Vega Series / Radeon Vega Mobile Series]" -> "Radeon
+# Vega Series", "TU106M [GeForce RTX 2060 Mobile]" -> "GeForce RTX 2060 Mobile".
+# Prints nothing if lspci is missing or the slot has no readable name.
+gpu_model() {
+  have lspci || return 0
+  local dev
+  dev=$(lspci -mm -s "$1" 2>/dev/null | head -1 | grep -oE '"[^"]*"' | sed -n '3p' | tr -d '"')
+  [ -n "$dev" ] || return 0
+  # Prefer the marketing name lspci puts in [brackets] after the codename.
+  [[ $dev =~ \[([^]]+)\] ]] && dev=${BASH_REMATCH[1]}
+  dev=${dev%% / *}          # collapse "Radeon Vega Series / ..." to the first
+  printf '%s' "$dev"
+}
+
 # ---------------------------------------------------------------- CPU + network
 # Both need a delta across a short window, so take the two snapshots back to
 # back around one sleep.
@@ -156,6 +171,7 @@ for dev in /sys/class/drm/card*/device; do
   # (bus << 8 | devfn) of the device's PCI address. Derive it so the right
   # sensor block is picked on any machine (the address is not fixed).
   pci=$(basename "$(readlink -f "$dev" 2>/dev/null)" 2>/dev/null)   # 0000:06:00.0
+  model=$(gpu_model "$pci")
   chip_suffix=""
   if [[ $pci =~ ^[0-9a-fA-F]+:([0-9a-fA-F]{2}):([0-9a-fA-F]{2})\.([0-7])$ ]]; then
     chip_suffix=$(printf 'pci-%04x' \
@@ -177,19 +193,21 @@ for dev in /sys/class/drm/card*/device; do
     0x10de) name="NVIDIA" ;;
   esac
   temp=$(awk -v v="${temp:-null}" 'BEGIN { if (v == "null" || v == "") print "null"; else printf "%.0f", v }')
-  GPU_JSON=$(jq -c --arg n "$name" --argjson b "${busy:-0}" --argjson t "$temp" \
-    '. + [{name:$n, util:$b, temp:$t, mem_pct:null}]' <<<"$GPU_JSON")
+  GPU_JSON=$(jq -c --arg n "$name" --arg m "$model" --argjson b "${busy:-0}" --argjson t "$temp" \
+    '. + [{name:$n, model:(if $m == "" then null else $m end), util:$b, temp:$t, mem_pct:null}]' <<<"$GPU_JSON")
 done
 
 # NVIDIA only in --full mode: nvidia-smi can spin the dGPU up.
 if [ "$FULL" = "1" ] && have nvidia-smi; then
   nv=$(nvidia-smi --query-gpu=utilization.gpu,temperature.gpu,memory.used,memory.total \
          --format=csv,noheader,nounits 2>/dev/null | head -1)
+  nv_name=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)
+  nv_name=${nv_name# }; nv_name=${nv_name#NVIDIA }   # "NVIDIA GeForce RTX 2060" -> "GeForce RTX 2060"
   if [ -n "$nv" ]; then
     IFS=', ' read -r nv_util nv_temp nv_mu nv_mt <<<"$nv"
     nv_mem_pct=$(awk -v u="${nv_mu:-0}" -v t="${nv_mt:-0}" 'BEGIN { print (t > 0 ? int(100*u/t) : 0) }')
-    GPU_JSON=$(jq -c --argjson u "${nv_util:-0}" --argjson tp "${nv_temp:-0}" --argjson mp "$nv_mem_pct" \
-      '. + [{name:"NVIDIA", util:$u, temp:$tp, mem_pct:$mp}]' <<<"$GPU_JSON")
+    GPU_JSON=$(jq -c --arg nm "$nv_name" --argjson u "${nv_util:-0}" --argjson tp "${nv_temp:-0}" --argjson mp "$nv_mem_pct" \
+      '. + [{name:"NVIDIA", model:(if $nm == "" then null else $nm end), util:$u, temp:$tp, mem_pct:$mp}]' <<<"$GPU_JSON")
   fi
 fi
 
