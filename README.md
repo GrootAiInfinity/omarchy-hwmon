@@ -12,13 +12,16 @@ detailed system panel on click.
 - **Right-click / scroll** toggles an expanded readout: adds `MEM%`, `GPU%`,
   `BAT%`. The choice is remembered across restarts.
 - **Left-click** opens the detail panel:
-  - CPU usage, frequency, load average, and a per-core bar grid
+  - System summary: machine model, CPU model, core / thread / socket count,
+    distro, kernel, architecture
+  - CPU usage, current / max frequency, load average, and a per-core bar grid
   - Memory and swap
   - Thermals and fan speeds
   - Per-GPU utilisation meters, each labelled with its model name (e.g.
     `Radeon Vega Series`, `GeForce RTX 2060`) — AMD iGPU via `gpu_busy_percent`
     sysfs, NVIDIA via `nvidia-smi`
-  - Disk usage per mount
+  - Storage devices: model name, bus (NVMe / SATA / USB), capacity, temperature
+  - Disk usage per mount (with the backing device)
   - Live network throughput per interface
   - Top processes by CPU and by RAM
   - Battery level and charge status
@@ -58,10 +61,18 @@ then set `expanded` on the `groot.hwmon` entry in `~/.config/omarchy/shell.json`
 
 ## Notes
 
-- No machine-specific values are hard-coded. `hwmon.qml` finds `hwmon.sh` via
-  `Qt.resolvedUrl(".")`; the GPU sensor block is matched by deriving the
-  libsensors chip name (`<driver>-pci-<bbdf>`) from each DRM card's PCI address,
-  with a fallback to the first `amdgpu*` / `i915*` chip.
+- No machine-specific values are hard-coded — every detail is discovered at
+  runtime, so the plugin works as-is on any machine it is installed on:
+  - CPU model / topology from `/proc/cpuinfo`, frequencies from
+    `/sys/devices/system/cpu/*/cpufreq`
+  - machine model / vendor from DMI (`/sys/devices/virtual/dmi/id`), distro from
+    `/etc/os-release`, kernel + arch from `uname`
+  - storage devices enumerated from `/sys/block` (model, rotational flag,
+    capacity, per-drive `hwmon` temperature); bus inferred from the device path
+  - `hwmon.qml` finds `hwmon.sh` via `Qt.resolvedUrl(".")`; the GPU sensor block
+    is matched by deriving the libsensors chip name (`<driver>-pci-<bbdf>`) from
+    each DRM card's PCI address, with a fallback to the first `amdgpu*` /
+    `i915*` chip.
 - GPU coverage: AMD and Intel utilisation via the `gpu_busy_percent` DRM sysfs
   counter (temp via `lm_sensors`); NVIDIA via `nvidia-smi` (panel-open only).
   A GPU with no `gpu_busy_percent` and no `nvidia-smi` shows no utilisation.

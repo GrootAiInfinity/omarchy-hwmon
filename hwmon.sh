@@ -19,6 +19,9 @@ FULL=0
 
 have() { command -v "$1" >/dev/null 2>&1; }
 
+# Collapse runs of whitespace and trim both ends.
+squish() { awk '{ $1 = $1; print }' <<<"$*"; }
+
 # Human-friendly GPU model name for a PCI address (e.g. 0000:06:00.0), via
 # lspci: "Renoir [Radeon Vega Series / Radeon Vega Mobile Series]" -> "Radeon
 # Vega Series", "TU106M [GeForce RTX 2060 Mobile]" -> "GeForce RTX 2060 Mobile".
@@ -100,6 +103,57 @@ FREQ_MHZ=$(awk '
   END { if (n > 0) printf "%.0f", (s / n) / 1000; else print "null" }
 ' /sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq 2>/dev/null)
 [ -z "$FREQ_MHZ" ] && FREQ_MHZ=null
+
+FREQ_MAX_MHZ=$(awk '
+  { if ($1 > m) m = $1 }
+  END { if (m > 0) printf "%.0f", m / 1000; else print "null" }
+' /sys/devices/system/cpu/cpu*/cpufreq/cpuinfo_max_freq 2>/dev/null)
+[ -z "$FREQ_MAX_MHZ" ] && FREQ_MAX_MHZ=null
+
+# ---------------------------------------------------------- static system info
+# All of this is dumb file parsing that works on any Linux box - no hard-coded
+# device names, and every field falls back to null / a sane default.
+
+CPU_MODEL=$(awk -F': ' '/^model name/ { print $2; exit } /^Model name/ { print $2; exit }' /proc/cpuinfo)
+CPU_MODEL=$(sed -E 's/\((R|TM|tm|r)\)//g; s/ CPU @.*$//; s/[[:space:]]+/ /g; s/^ //; s/ $//' <<<"$CPU_MODEL")
+[ -z "$CPU_MODEL" ] && CPU_MODEL="$(uname -m) processor"
+
+# Physical cores / logical threads / sockets from /proc/cpuinfo topology. Falls
+# back to the thread count when an arch omits physical/core ids (VMs, some ARM).
+read -r CORES_PHYS THREADS SOCKETS < <(awk -F': ' '
+  /^processor/   { th++ }
+  /^physical id/ { pid = $2; sock[pid] = 1 }
+  /^core id/     { core[pid ":" $2] = 1 }
+  /^cpu cores/   { cc = $2 }
+  END {
+    s = 0; for (k in sock) s++
+    c = 0; for (k in core) c++
+    if (s == 0) s = 1
+    if (c == 0) c = (cc > 0 ? cc * s : th)
+    print c, th, s
+  }' /proc/cpuinfo)
+
+dmi() { cat "/sys/devices/virtual/dmi/id/$1" 2>/dev/null; }
+_sv=$(squish "$(dmi sys_vendor)"); _pf=$(squish "$(dmi product_family)")
+_pn=$(squish "$(dmi product_name)"); _bn=$(squish "$(dmi board_name)")
+_pv=$(squish "$(dmi product_version)")
+_junk='Default string|To be filled by O\.E\.M\.|System Product Name|None|Not Applicable|N/A'
+for _v in _pf _pn _pv; do [[ ${!_v} =~ ^($_junk)$ ]] && printf -v "$_v" '%s' ''; done
+# Lenovo hides the friendly name ("ThinkPad X1 ...") in product_version.
+case "$_sv" in LENOVO|Lenovo*) HOST_MODEL=${_pv:-${_pf:-$_pn}} ;; *) HOST_MODEL=${_pf:-$_pn} ;; esac
+[ -n "$_bn" ] && HOST_MODEL=${HOST_MODEL%_$_bn}          # drop a duplicated "_BOARD" suffix
+_sv=$(sed -E 's/ (COMPUTER )?(INC\.?|CORP\.?|CORPORATION|CO\.,? LTD\.?|GMBH|S\.A\.)//I; s/[.,]+$//; s/[[:space:]]+/ /g' <<<"$_sv")
+[ "$_sv" = "ASUSTeK" ] && _sv="ASUS"
+case "$HOST_MODEL" in
+  ""|null)                                   HOST_MODEL=$_sv ;;
+  "$_sv"*|ASUS*|Dell*|Lenovo*|LENOVO*|HP*|Hewlett*|MSI*|Micro-Star*|Acer*|Razer*|Gigabyte*|Framework*|Apple*|Microsoft*)
+                                             : ;;
+  *)                                         HOST_MODEL="${_sv:+$_sv }$HOST_MODEL" ;;
+esac
+
+KERNEL=$(uname -r)
+ARCH=$(uname -m)
+DISTRO=$( . /etc/os-release 2>/dev/null; printf '%s' "${PRETTY_NAME:-${NAME:-Linux}}" )
 
 # ---------------------------------------------------------------- memory
 read -r MEM_TOTAL MEM_AVAIL SWAP_TOTAL SWAP_FREE < <(
@@ -219,14 +273,57 @@ DISK_JSON=$(
       src = $1; tgt = $2; gsub(/%/, "", $3); pct = $3; used = $4; size = $5
       if (seen[src]++) next            # btrfs subvolumes share a device
       gsub(/,/, "", used); gsub(/,/, "", size)
-      printf "%s{\"mount\":\"%s\",\"pct\":%d,\"used_gib\":%.1f,\"total_gib\":%.1f}",
-             (n++ ? "," : ""), tgt, pct, used/1073741824, size/1073741824
+      dev = src; sub(/.*\//, "", dev); sub(/p?[0-9]+$/, "", dev)   # /dev/nvme0n1p2 -> nvme0n1
+      printf "%s{\"mount\":\"%s\",\"dev\":\"%s\",\"pct\":%d,\"used_gib\":%.1f,\"total_gib\":%.1f}",
+             (n++ ? "," : ""), tgt, dev, pct, used/1073741824, size/1073741824
     }
     END { }' \
   | sed 's/^/[/; s/$/]/'
 )
 [ "$DISK_JSON" = "[]" ] || [ -n "$DISK_JSON" ] || DISK_JSON="[]"
 echo "$DISK_JSON" | jq -e . >/dev/null 2>&1 || DISK_JSON="[]"
+
+# --------------------------------------------------------- storage devices
+# Physical block devices with model / bus / capacity / temperature, straight
+# from sysfs so it needs no extra tools and adapts to whatever is plugged in.
+# Only gathered with --full (panel open), like the top-process list.
+STORAGE_JSON="[]"
+if [ "$FULL" = "1" ]; then
+  for blk in /sys/block/*; do
+    bn=${blk##*/}
+    case "$bn" in loop*|ram*|zram*|md*|dm-*|sr*|fd*) continue ;; esac
+    sectors=$(cat "$blk/size" 2>/dev/null || echo 0)
+    [ "${sectors:-0}" -gt 0 ] 2>/dev/null || continue
+
+    rota=$(cat "$blk/queue/rotational" 2>/dev/null || echo 0)
+    dmodel=$(squish "$(cat "$blk/device/model" 2>/dev/null)")
+    [ -z "$dmodel" ] && dmodel=$(squish "$(cat "$blk/device/name" 2>/dev/null)")
+    dvendor=$(squish "$(cat "$blk/device/vendor" 2>/dev/null)")
+    case "$dvendor" in ""|ATA|"Generic"|"Linux") ;; *) dmodel=$(squish "$dvendor $dmodel") ;; esac
+    [ -z "$dmodel" ] && dmodel=$bn
+
+    case "$bn" in
+      nvme*)   tran=NVMe ;;
+      mmcblk*) tran="eMMC/SD" ;;
+      *) if readlink -f "$blk/device" 2>/dev/null | grep -q '/usb'; then tran=USB; else tran=SATA; fi ;;
+    esac
+    [ "$rota" = "1" ] && kind=HDD || kind=SSD
+
+    dtemp=null
+    for h in "$blk"/device/hwmon*/temp1_input "$blk"/device/hwmon/hwmon*/temp1_input; do
+      [ -r "$h" ] || continue
+      dtemp=$(awk -v v="$(cat "$h" 2>/dev/null)" 'BEGIN { if (v == "") print "null"; else printf "%.0f", v / 1000 }')
+      break
+    done
+
+    size_gb=$(awk -v s="$sectors" 'BEGIN { printf "%.1f", s * 512 / 1e9 }')
+    STORAGE_JSON=$(jq -c --arg name "$bn" --arg model "$dmodel" --arg tran "$tran" \
+      --arg kind "$kind" --argjson size_gb "$size_gb" --argjson temp "$dtemp" \
+      '. + [{name:$name, model:$model, tran:$tran, kind:$kind, size_gb:$size_gb, temp:$temp}]' \
+      <<<"$STORAGE_JSON")
+  done
+  echo "$STORAGE_JSON" | jq -e . >/dev/null 2>&1 || STORAGE_JSON="[]"
+fi
 
 # ---------------------------------------------------------------- battery
 BAT_JSON=null
@@ -267,6 +364,16 @@ jq -nc \
   --argjson ncpu "${NCPU:-1}" \
   --argjson load "[${LOAD1:-0},${LOAD5:-0},${LOAD15:-0}]" \
   --argjson freq_mhz "${FREQ_MHZ:-null}" \
+  --argjson freq_max_mhz "${FREQ_MAX_MHZ:-null}" \
+  --arg cpu_model "${CPU_MODEL:-}" \
+  --argjson cores_phys "${CORES_PHYS:-0}" \
+  --argjson threads "${THREADS:-0}" \
+  --argjson sockets "${SOCKETS:-1}" \
+  --arg host_model "${HOST_MODEL:-}" \
+  --arg kernel "${KERNEL:-}" \
+  --arg arch "${ARCH:-}" \
+  --arg distro "${DISTRO:-}" \
+  --argjson storage "${STORAGE_JSON:-[]}" \
   --argjson mem_pct "${MEM_PCT:-0}" \
   --argjson mem_used_gib "${MEM_USED_GIB:-0}" \
   --argjson mem_total_gib "${MEM_TOTAL_GIB:-0}" \
@@ -285,10 +392,17 @@ jq -nc \
   --argjson top_mem "${TOP_MEM_JSON:-[]}" \
   --argjson full "$FULL" \
   '{
-    cpu_pct: $cpu_pct, cpu_cores: $cpu_cores, ncpu: $ncpu, load: $load, freq_mhz: $freq_mhz,
+    cpu_pct: $cpu_pct, cpu_cores: $cpu_cores, ncpu: $ncpu, load: $load,
+    freq_mhz: $freq_mhz, freq_max_mhz: $freq_max_mhz,
+    cpu_model: (if $cpu_model == "" then null else $cpu_model end),
+    cpu_topology: { cores: $cores_phys, threads: $threads, sockets: $sockets },
+    host: {
+      model: (if $host_model == "" then null else $host_model end),
+      kernel: $kernel, arch: $arch, distro: $distro
+    },
     mem_pct: $mem_pct, mem_used_gib: $mem_used_gib, mem_total_gib: $mem_total_gib,
     swap_pct: $swap_pct, swap_used_gib: $swap_used_gib, swap_total_gib: $swap_total_gib,
     temp_c: $temp_c, temp_label: $temp_label, fans: $fans, gpus: $gpus,
-    disks: $disks, net: $net, battery: $battery, uptime: $uptime,
+    disks: $disks, storage: $storage, net: $net, battery: $battery, uptime: $uptime,
     top_cpu: $top_cpu, top_mem: $top_mem, full: ($full == 1)
   }'

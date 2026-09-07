@@ -77,6 +77,11 @@ Panel {
     var n = Number(kbs) || 0
     return n >= 1024 ? (Math.round(n / 102.4) / 10).toFixed(1) + " MB/s" : Math.round(n) + " KB/s"
   }
+  function fmtSize(gb) {
+    var n = Number(gb) || 0
+    if (n >= 1000) return (Math.round(n / 100) / 10).toFixed(1).replace(/\.0$/, "") + " TB"
+    return Math.round(n) + " GB"
+  }
   function meterColor(v, warn, crit) {
     if (v >= crit) return Color.urgent
     if (v >= warn) return Qt.tint(Color.accent, Qt.rgba(Color.urgent.r, Color.urgent.g, Color.urgent.b, 0.5))
@@ -281,12 +286,55 @@ Panel {
             }
           }
 
+          // -------------------------------------------------- System
+          Item {
+            width: parent.width
+            visible: !!(root.stats.cpu_model || (root.stats.host && root.stats.host.model))
+            implicitHeight: sysCol.implicitHeight
+            Column {
+              id: sysCol
+              width: parent.width
+              spacing: Style.space(4)
+
+              InfoRow {
+                label: "Host"
+                value: root.stats.host && root.stats.host.model ? root.stats.host.model : ""
+              }
+              InfoRow {
+                label: "CPU"
+                value: root.stats.cpu_model || ""
+              }
+              InfoRow {
+                label: "Cores"
+                value: {
+                  var t = root.stats.cpu_topology
+                  if (!t) return ""
+                  var s = t.cores + (t.cores === 1 ? " core" : " cores")
+                          + "  ·  " + t.threads + (t.threads === 1 ? " thread" : " threads")
+                  if (t.sockets > 1) s += "  ·  " + t.sockets + " sockets"
+                  return s
+                }
+              }
+              InfoRow {
+                label: "OS"
+                value: {
+                  if (!root.stats.host) return ""
+                  var s = root.stats.host.distro || ""
+                  if (root.stats.host.kernel) s += (s ? "  ·  " : "") + root.stats.host.kernel
+                  if (root.stats.host.arch) s += (s ? "  ·  " : "") + root.stats.host.arch
+                  return s
+                }
+              }
+            }
+          }
+
           // -------------------------------------------------- CPU
           PanelSeparator { width: parent.width; foreground: root.fg }
 
           SectionHead {
             title: "CPU"
             detail: root.cpuPct + "%   ·   " + root.fmtGhz(root.stats.freq_mhz)
+                    + (root.stats.freq_max_mhz ? " / " + root.fmtGhz(root.stats.freq_max_mhz) : "")
                     + (root.stats.load ? "   ·   load " + root.stats.load.join(" ") : "")
           }
           Meter { width: parent.width; value: root.cpuPct }
@@ -397,6 +445,54 @@ Panel {
             }
           }
 
+          // -------------------------------------------------- Storage devices
+          Item {
+            width: parent.width
+            visible: (root.stats.storage || []).length > 0
+            implicitHeight: stoCol.implicitHeight
+            Column {
+              id: stoCol
+              width: parent.width
+              spacing: Style.space(8)
+
+              PanelSeparator { width: parent.width; foreground: root.fg }
+              SectionHead { title: "STORAGE" }
+
+              Repeater {
+                model: root.stats.storage || []
+                Item {
+                  required property var modelData
+                  width: stoCol.width
+                  implicitHeight: stoRow.implicitHeight
+                  Row {
+                    id: stoRow
+                    width: parent.width
+                    Text {
+                      textFormat: Text.PlainText
+                      text: modelData.model || modelData.name
+                      width: parent.width * 0.58
+                      elide: Text.ElideRight
+                      color: root.fg
+                      font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                      font.pixelSize: Style.font.body
+                    }
+                    Text {
+                      textFormat: Text.PlainText
+                      text: root.fmtSize(modelData.size_gb) + "  ·  " + (modelData.tran || modelData.kind)
+                            + (modelData.temp !== null && modelData.temp !== undefined
+                               ? "  ·  " + Math.round(modelData.temp) + "°C" : "")
+                      width: parent.width * 0.42
+                      horizontalAlignment: Text.AlignRight
+                      color: Qt.darker(root.fg, 1.3)
+                      font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                      font.pixelSize: Style.font.body
+                    }
+                  }
+                }
+              }
+            }
+          }
+
           // -------------------------------------------------- Disks
           Item {
             width: parent.width
@@ -418,7 +514,8 @@ Panel {
                   spacing: Style.space(4)
                   SectionHead {
                     title: modelData.mount
-                    detail: root.fmt1(modelData.used_gib) + " / " + root.fmt1(modelData.total_gib) + " GiB"
+                    detail: (modelData.dev ? modelData.dev + "   ·   " : "")
+                            + root.fmt1(modelData.used_gib) + " / " + root.fmt1(modelData.total_gib) + " GiB"
                     small: true
                   }
                   Meter { width: parent.width; value: Number(modelData.pct) || 0; warn: 85; crit: 95 }
@@ -554,6 +651,42 @@ Panel {
       anchors.right: parent.right
       anchors.rightMargin: Style.space(2)
       anchors.verticalCenter: parent.verticalCenter
+    }
+  }
+
+  // Label / value line for the static system-info block.
+  component InfoRow: Item {
+    property string label: ""
+    property string value: ""
+    width: parent ? parent.width : 0
+    visible: value !== ""
+    implicitHeight: Math.max(infoLabel.implicitHeight, infoValue.implicitHeight)
+
+    Text {
+      id: infoLabel
+      textFormat: Text.PlainText
+      text: parent.label
+      width: parent.width * 0.22
+      color: Qt.darker(root.fg, 1.35)
+      font.family: root.bar ? root.bar.fontFamily : Style.font.family
+      font.pixelSize: Style.font.caption
+      font.bold: true
+      anchors.left: parent.left
+      anchors.top: parent.top
+    }
+    Text {
+      id: infoValue
+      textFormat: Text.PlainText
+      text: parent.value
+      wrapMode: Text.WordWrap
+      horizontalAlignment: Text.AlignRight
+      color: root.fg
+      font.family: root.bar ? root.bar.fontFamily : Style.font.family
+      font.pixelSize: Style.font.caption
+      anchors.left: infoLabel.right
+      anchors.right: parent.right
+      anchors.rightMargin: Style.space(2)
+      anchors.top: parent.top
     }
   }
 
