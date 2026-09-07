@@ -56,14 +56,16 @@ then set `expanded` on the `groot.hwmon` entry in `~/.config/omarchy/shell.json`
 
 ## Notes
 
-- `hwmon.qml` resolves `hwmon.sh` by an absolute path
-  (`~/.config/omarchy/bar/scripts/hwmon.sh`, hard-coded as `/home/<user>/…`).
-  If your username isn't `groot`, edit the `script` / `stateFile` properties at
-  the top of `hwmon.qml`.
+- No machine-specific values are hard-coded. `hwmon.qml` finds `hwmon.sh` via
+  `Qt.resolvedUrl(".")`; the GPU sensor block is matched by deriving the
+  libsensors chip name (`<driver>-pci-<bbdf>`) from each DRM card's PCI address,
+  with a fallback to the first `amdgpu*` / `i915*` chip.
+- GPU coverage: AMD and Intel utilisation via the `gpu_busy_percent` DRM sysfs
+  counter (temp via `lm_sensors`); NVIDIA via `nvidia-smi` (panel-open only).
+  A GPU with no `gpu_busy_percent` and no `nvidia-smi` shows no utilisation.
 - `omarchy update` / `omarchy refresh shell` rewrites `shell.json` and drops the
-  `hwmon` layout entry (the widget files survive). Re-add the entry and
-  `omarchy restart shell`.
-- Custom `type: qml` modules don't appear in `omarchy-shell shell listPlugins`.
+  `hwmon` layout entry (the widget files survive). Re-run
+  `omarchy plugin enable groot.hwmon` and `omarchy restart shell`.
 
 ## License
 

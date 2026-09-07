@@ -9,7 +9,7 @@ import qs.Commons
 //   Left click  - open the detailed panel (CPU cores, GPUs, disks, net, procs)
 //   Right click - toggle the compact / expanded readout in the bar itself
 //   Scroll      - same toggle
-// Backend: ~/.config/omarchy/bar/scripts/hwmon.sh
+// Backend: hwmon.sh, bundled alongside this file in the plugin folder.
 Panel {
   id: root
   moduleName: "groot.hwmon"

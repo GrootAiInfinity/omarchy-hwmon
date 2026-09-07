@@ -151,13 +151,30 @@ for dev in /sys/class/drm/card*/device; do
   busy=$(cat "$dev/gpu_busy_percent" 2>/dev/null || echo 0)
   name="GPU"
   temp=null
+
+  # libsensors names a PCI chip "<driver>-pci-<bbdf>" where bbdf = the 16-bit
+  # (bus << 8 | devfn) of the device's PCI address. Derive it so the right
+  # sensor block is picked on any machine (the address is not fixed).
+  pci=$(basename "$(readlink -f "$dev" 2>/dev/null)" 2>/dev/null)   # 0000:06:00.0
+  chip_suffix=""
+  if [[ $pci =~ ^[0-9a-fA-F]+:([0-9a-fA-F]{2}):([0-9a-fA-F]{2})\.([0-7])$ ]]; then
+    chip_suffix=$(printf 'pci-%04x' \
+      "$(( (16#${BASH_REMATCH[1]} << 8) | (16#${BASH_REMATCH[2]} << 3) | ${BASH_REMATCH[3]} ))")
+  fi
+
   case "$vendor" in
     0x1002) name="AMD"
-      temp=$(jq -r '[ .["amdgpu-pci-0500"] // {} | to_entries[]
-                      | select(.key|test("edge|junction|GPU"; "i"))
-                      | .value | to_entries[] | select(.key|test("_input$")) | .value ] | (.[0] // "null")' \
+      temp=$(jq -r --arg chip "amdgpu-$chip_suffix" '
+        ( .[$chip] // ( [ to_entries[] | select(.key|test("^amdgpu")) | .value ] | .[0] ) // {} )
+        | [ to_entries[] | select(.key|test("edge|junction|GPU"; "i"))
+            | .value | to_entries[] | select(.key|test("_input$")) | .value ] | (.[0] // "null")' \
                    <<<"$SENSORS_JSON" 2>/dev/null) ;;
-    0x8086) name="Intel" ;;
+    0x8086) name="Intel"
+      temp=$(jq -r '
+        ( [ to_entries[] | select(.key|test("^i915|^xe|^intel")) | .value ] | .[0] // {} )
+        | [ to_entries[] | select(.key|test("_input$")) | .value ] | (.[0] // "null")' \
+                   <<<"$SENSORS_JSON" 2>/dev/null) ;;
+    0x10de) name="NVIDIA" ;;
   esac
   temp=$(awk -v v="${temp:-null}" 'BEGIN { if (v == "null" || v == "") print "null"; else printf "%.0f", v }')
   GPU_JSON=$(jq -c --arg n "$name" --argjson b "${busy:-0}" --argjson t "$temp" \
