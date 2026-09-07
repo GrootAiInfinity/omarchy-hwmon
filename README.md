@@ -34,21 +34,25 @@ detailed system panel on click.
 ## Install
 
 ```sh
-git clone https://github.com/GrootAiInfinity/omarchy-hwmon.git && cd omarchy-hwmon && ./install.sh
+omarchy plugin add https://github.com/GrootAiInfinity/omarchy-hwmon.git --enable
 ```
 
-That one line does everything: copies `hwmon.qml` + `hwmon.sh` into
-`~/.config/omarchy/`, adds `{ "id": "hwmon", "type": "qml" }` to `bar.layout`
-in `shell.json` (backing it up first, idempotently), rewrites the hard-coded
-`$HOME` path, and runs `omarchy restart shell`. Requires `jq`.
+Adds the widget to the right side of the bar. Remove it with
+`omarchy plugin remove groot.hwmon`, update with `omarchy plugin update groot.hwmon`.
 
 ### Optional: start expanded
 
-Edit the `hwmon` entry in `~/.config/omarchy/shell.json`:
+```sh
+omarchy plugin enable groot.hwmon   # if not already
+```
+
+then set `expanded` on the `groot.hwmon` entry in `~/.config/omarchy/shell.json`:
 
 ```json
-{ "id": "hwmon", "type": "qml", "expanded": true }
+{ "id": "groot.hwmon", "expanded": true }
 ```
+
+(also toggled any time with right-click / scroll on the widget).
 
 ## Notes
 
