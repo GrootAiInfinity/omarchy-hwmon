@@ -1,7 +1,7 @@
 {
   "$schema": "https://raw.githubusercontent.com/omarchy/omarchy/main/schemas/plugin.json",
   "schemaVersion": 1,
-  "id": "groot.hwmon",
+  "id": "io.github.grootaiinfinity.hwmon",
   "name": "Hardware Monitor",
   "version": "1.0.0",
   "author": "groot",

@@ -12,8 +12,8 @@ import qs.Commons
 // Backend: hwmon.sh, bundled alongside this file in the plugin folder.
 Panel {
   id: root
-  moduleName: "groot.hwmon"
-  ipcTarget: "groot.hwmon"
+  moduleName: "io.github.grootaiinfinity.hwmon"
+  ipcTarget: "io.github.grootaiinfinity.hwmon"
 
   // Resolve the bundled backend script relative to this plugin's own folder,
   // wherever `omarchy plugin add` installed it.

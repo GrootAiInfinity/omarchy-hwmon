@@ -43,18 +43,20 @@ omarchy plugin add https://github.com/GrootAiInfinity/omarchy-hwmon.git --enable
 ```
 
 Adds the widget to the right side of the bar. Remove it with
-`omarchy plugin remove groot.hwmon`, update with `omarchy plugin update groot.hwmon`.
+`omarchy plugin remove io.github.grootaiinfinity.hwmon`, update with
+`omarchy plugin update io.github.grootaiinfinity.hwmon`.
 
 ### Optional: start expanded
 
 ```sh
-omarchy plugin enable groot.hwmon   # if not already
+omarchy plugin enable io.github.grootaiinfinity.hwmon   # if not already
 ```
 
-then set `expanded` on the `groot.hwmon` entry in `~/.config/omarchy/shell.json`:
+then set `expanded` on the `io.github.grootaiinfinity.hwmon` entry in
+`~/.config/omarchy/shell.json`:
 
 ```json
-{ "id": "groot.hwmon", "expanded": true }
+{ "id": "io.github.grootaiinfinity.hwmon", "expanded": true }
 ```
 
 (also toggled any time with right-click / scroll on the widget).
@@ -81,7 +83,7 @@ then set `expanded` on the `groot.hwmon` entry in `~/.config/omarchy/shell.json`
   `lspci` the meter falls back to the bare vendor label.
 - `omarchy update` / `omarchy refresh shell` rewrites `shell.json` and drops the
   `hwmon` layout entry (the widget files survive). Re-run
-  `omarchy plugin enable groot.hwmon` and `omarchy restart shell`.
+  `omarchy plugin enable io.github.grootaiinfinity.hwmon` and `omarchy restart shell`.
 
 ## License
 
