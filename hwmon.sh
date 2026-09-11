@@ -156,6 +156,18 @@ state_read() {
 # rename(2) then replaces the destination - symlink or not - without following
 # it, which is also why the old "remove it first" step is gone: that was a
 # check-then-open race of its own, and the rename never needed it.
+STATE_TMP=                # in flight, for the cleanup trap below
+
+# Remove a temporary file that never made it to the rename. The signal traps
+# have to exit as well: a handler returns to where it interrupted, which for a
+# SIGTERM between the create and the rename means carrying on to `mv` a file
+# this just deleted.
+state_cleanup() {
+  [ -n "${STATE_TMP:-}" ] && rm -f -- "$STATE_TMP"
+  STATE_TMP=
+  return 0
+}
+
 state_write() {
   local v=$1 f d tmp rand
   case "$v" in 0|1) ;; *) printf 'hwmon.sh: state-write takes 0 or 1\n' >&2; exit 2 ;; esac
@@ -165,9 +177,20 @@ state_write() {
   [ -d "$d" ] || mkdir -m 700 -p -- "$d" 2>/dev/null
   dir_is_safe "$d" || { printf 'hwmon.sh: state directory is not a private directory we own\n' >&2; exit 1; }
 
+  # A write killed between creating the temporary file and renaming it leaves
+  # that file behind - and the widget's Process objects are torn down, children
+  # and all, whenever the plugin reloads. A predictable name used to make that
+  # self-limiting; an unguessable one would accumulate instead, so sweep the
+  # ones old enough that no live writer can still own them. The trap covers
+  # every death this process can still act on; the sweep covers SIGKILL.
+  find "$d" -maxdepth 1 -type f -name '.expanded.*' -mmin +1 -delete 2>/dev/null
+
   rand=$(od -An -N8 -tx1 /dev/urandom 2>/dev/null | tr -dc 'a-f0-9')
   [ ${#rand} -eq 16 ] || { printf 'hwmon.sh: no randomness for a temporary name\n' >&2; exit 1; }
   tmp=$d/.expanded.$rand
+  STATE_TMP=$tmp                                # a local would be out of scope
+  trap state_cleanup EXIT
+  trap 'state_cleanup; exit 1' INT TERM HUP
 
   printf '%s' "$v" | run dd of="$tmp" oflag=nofollow conv=excl,fsync status=none 2>/dev/null
   [ "${PIPESTATUS[1]}" = 0 ] || { rm -f -- "$tmp"; exit 1; }
@@ -176,6 +199,7 @@ state_write() {
   # through, so confirm it is still ours and still private before committing.
   dir_is_safe "$d" || { rm -f -- "$tmp"; exit 1; }
   mv -f -- "$tmp" "$f" || { rm -f -- "$tmp"; exit 1; }
+  STATE_TMP=                                    # renamed: nothing left to undo
   sync -- "$d" 2>/dev/null || :                 # the rename itself, durably
 }
 

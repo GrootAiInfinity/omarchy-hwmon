@@ -4,6 +4,26 @@ All notable changes to this plugin are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.2] — 2026-09-11
+
+Cleans up after an interrupted state-file write. No change to what the widget
+shows.
+
+### Fixed
+
+- **An interrupted write left its temporary file behind.** 1.2.1 gave the
+  temporary file an unguessable name, which removed the old predictable one but
+  also removed what made the leftovers self-limiting: a write killed between
+  creating that file and renaming it now left a new one each time, and the
+  widget's `Process` objects are torn down, children and all, every time the
+  plugin reloads. Writes now clean up on exit and on a signal, and sweep any
+  leftover older than a minute — old enough that no live writer can still own
+  it — so a concurrent write is never disturbed.
+- **A terminated write could log an error.** The cleanup on SIGTERM removed the
+  temporary file and then returned to where it interrupted, which went on to
+  `mv` the file it had just deleted and printed the failure to stderr. The
+  signal handlers exit after cleaning up.
+
 ## [1.2.1] — 2026-09-11
 
 Closes a time-of-check/time-of-use race in the state file, from the follow-up
@@ -173,6 +193,7 @@ First packaged release as an Omarchy plugin.
   from each card's PCI address rather than hard-coded.
 - Plugin id `io.github.grootaiinfinity.hwmon`.
 
+[1.2.2]: https://github.com/GrootAiInfinity/omarchy-hwmon/releases/tag/v1.2.2
 [1.2.1]: https://github.com/GrootAiInfinity/omarchy-hwmon/releases/tag/v1.2.1
 [1.2.0]: https://github.com/GrootAiInfinity/omarchy-hwmon/releases/tag/v1.2.0
 [1.1.0]: https://github.com/GrootAiInfinity/omarchy-hwmon/releases/tag/v1.1.0

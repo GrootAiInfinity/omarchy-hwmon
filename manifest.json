@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.grootaiinfinity.hwmon",
   "name": "Hardware Monitor",
-  "version": "1.2.1",
+  "version": "1.2.2",
   "author": "groot",
   "license": "MIT",
   "description": "Live CPU / temperature readout in the bar; click for a detailed system panel (CPU cores, memory, thermals, GPUs, disks, network, top processes, battery).",
