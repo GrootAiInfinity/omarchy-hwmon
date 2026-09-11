@@ -1,23 +1,74 @@
 #!/usr/bin/env bash
-# Hardware monitor backend for the custom omarchy bar module (hwmon.qml).
+# Hardware monitor backend for the Omarchy bar widget (hwmon.qml).
 #
 #   hwmon.sh stats          Lightweight sample: CPU, memory, load, temps, fans,
-#                           AMD GPU, disks, network, battery, uptime.
+#                           AMD/Intel GPU, disks, network, battery, uptime.
 #   hwmon.sh stats --full   Everything above plus NVIDIA GPU (nvidia-smi, which
-#                           can wake the dGPU) and the top processes by CPU/RAM.
+#                           can wake the dGPU), physical storage devices and the
+#                           top processes by CPU/RAM.
+#   hwmon.sh --help         Usage.
 #
 # Output is a single line of JSON on stdout. Missing metrics are emitted as
-# null / empty arrays so the QML side can just check for them.
+# null / empty arrays so the QML side can just check for them. Every value that
+# reaches the JSON is either produced by jq (which escapes it) or passed through
+# `num`, so no reading from /proc, /sys, `ps` or `df` can produce broken JSON.
+#
+# The script reads only kernel-provided files and runs only read-only tools. It
+# never writes anything, never asks for elevated privileges, and never touches
+# the network.
 
 set -u
 
+# Parsing tool output is only deterministic in the C locale: another locale can
+# translate df's header, or make awk/ps print "1,5" where JSON needs "1.5".
+export LC_ALL=C
+
 SAMPLE_INTERVAL=0.35
-MODE="${1:-stats}"
+
+usage() {
+  cat <<'EOF'
+Usage: hwmon.sh [stats] [--full]
+       hwmon.sh --help
+
+  stats     Emit one line of JSON describing the current hardware state.
+  --full    Also collect NVIDIA GPU stats, storage devices and top processes.
+            Costs more and can wake a sleeping discrete GPU, so the widget
+            only asks for it while its panel is open.
+EOF
+}
+
 FULL=0
-[ "${2:-}" = "--full" ] && FULL=1
-[ "${1:-}" = "--full" ] && FULL=1
+for arg in "$@"; do
+  case "$arg" in
+    stats)      ;;
+    --full)     FULL=1 ;;
+    -h|--help)  usage; exit 0 ;;
+    *)          printf 'hwmon.sh: unknown argument: %s\n' "$arg" >&2; usage >&2; exit 2 ;;
+  esac
+done
 
 have() { command -v "$1" >/dev/null 2>&1; }
+
+# jq builds and escapes every string that reaches the output, so there is no
+# degraded mode without it. Report it in-band: the widget shows the message
+# instead of a readout that silently reads zero.
+if ! have jq; then
+  printf '{"error":"hwmon: jq is not installed"}\n'
+  exit 1
+fi
+
+# Read a single-line file without forking cat.
+rd() { local v=""; [ -r "$1" ] && IFS= read -r v <"$1" 2>/dev/null; printf '%s' "$v"; }
+
+# Echo the argument if it is a plain number, else the fallback (default null).
+# Everything passed to `jq --argjson` goes through this: a sensor that returns
+# "N/A", an empty sysfs read or a truncated file would otherwise abort jq and
+# take a whole section of the panel down with it.
+num() {
+  awk -v v="${1-}" -v d="${2-null}" 'BEGIN {
+    if (v ~ /^-?[0-9]+(\.[0-9]+)?$/) printf "%s", v; else printf "%s", d
+  }'
+}
 
 # Collapse runs of whitespace and trim both ends.
 squish() { awk '{ $1 = $1; print }' <<<"$*"; }
@@ -34,7 +85,7 @@ gpu_model() {
   # Prefer the marketing name lspci puts in [brackets] after the codename.
   [[ $dev =~ \[([^]]+)\] ]] && dev=${BASH_REMATCH[1]}
   dev=${dev%% / *}          # collapse "Radeon Vega Series / ..." to the first
-  printf '%s' "$dev"
+  printf '%s' "$(squish "$dev")"
 }
 
 # ---------------------------------------------------------------- CPU + network
@@ -47,9 +98,9 @@ declare -A NET_RX1 NET_TX1
 for dev in /sys/class/net/*; do
   ifc=${dev##*/}
   [ "$ifc" = "lo" ] && continue
-  [ "$(cat "$dev/operstate" 2>/dev/null)" = "up" ] || continue
-  NET_RX1[$ifc]=$(cat "$dev/statistics/rx_bytes" 2>/dev/null || echo 0)
-  NET_TX1[$ifc]=$(cat "$dev/statistics/tx_bytes" 2>/dev/null || echo 0)
+  [ "$(rd "$dev/operstate")" = "up" ] || continue
+  NET_RX1[$ifc]=$(num "$(rd "$dev/statistics/rx_bytes")" 0)
+  NET_TX1[$ifc]=$(num "$(rd "$dev/statistics/tx_bytes")" 0)
 done
 t1=${EPOCHREALTIME:-$(date +%s.%N)}
 
@@ -80,19 +131,26 @@ read -r CPU_PCT CPU_CORES_JSON < <(
       printf "%.0f %s\n", overall, cores
     }'
 )
+jq -e . >/dev/null 2>&1 <<<"${CPU_CORES_JSON:-}" || CPU_CORES_JSON="[]"
 
-NET_JSON="[]"
+# One jq for the whole interface list rather than one per interface. Interface
+# names cannot contain whitespace, so a tab-separated line is unambiguous.
+net_rows=""
 for ifc in "${!NET_RX1[@]}"; do
-  rx2=$(cat "/sys/class/net/$ifc/statistics/rx_bytes" 2>/dev/null || echo 0)
-  tx2=$(cat "/sys/class/net/$ifc/statistics/tx_bytes" 2>/dev/null || echo 0)
-  entry=$(awk -v ifc="$ifc" -v r1="${NET_RX1[$ifc]}" -v r2="$rx2" \
-              -v x1="${NET_TX1[$ifc]}" -v x2="$tx2" -v dt="$dt" 'BEGIN {
+  rx2=$(num "$(rd "/sys/class/net/$ifc/statistics/rx_bytes")" 0)
+  tx2=$(num "$(rd "/sys/class/net/$ifc/statistics/tx_bytes")" 0)
+  net_rows+=$(awk -v ifc="$ifc" -v r1="${NET_RX1[$ifc]}" -v r2="$rx2" \
+                  -v x1="${NET_TX1[$ifc]}" -v x2="$tx2" -v dt="$dt" 'BEGIN {
     rx = (r2 - r1) / dt / 1024; tx = (x2 - x1) / dt / 1024
     if (rx < 0) rx = 0; if (tx < 0) tx = 0
-    printf "{\"iface\":\"%s\",\"rx_kbs\":%.1f,\"tx_kbs\":%.1f}", ifc, rx, tx
-  }')
-  NET_JSON=$(jq -c --argjson e "$entry" '. + [$e]' <<<"$NET_JSON")
+    printf "%s\t%.1f\t%.1f", ifc, rx, tx
+  }')$'\n'
 done
+NET_JSON=$(jq -Rsc '
+  split("\n") | map(select(length > 0) | split("\t")
+  | { iface: .[0], rx_kbs: (.[1] | tonumber), tx_kbs: (.[2] | tonumber) })
+' <<<"$net_rows" 2>/dev/null)
+[ -n "$NET_JSON" ] || NET_JSON="[]"
 
 # ---------------------------------------------------------------- load / freq
 read -r LOAD1 LOAD5 LOAD15 _ < /proc/loadavg
@@ -102,13 +160,11 @@ FREQ_MHZ=$(awk '
   { s += $1; n++ }
   END { if (n > 0) printf "%.0f", (s / n) / 1000; else print "null" }
 ' /sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq 2>/dev/null)
-[ -z "$FREQ_MHZ" ] && FREQ_MHZ=null
 
 FREQ_MAX_MHZ=$(awk '
   { if ($1 > m) m = $1 }
   END { if (m > 0) printf "%.0f", m / 1000; else print "null" }
 ' /sys/devices/system/cpu/cpu*/cpufreq/cpuinfo_max_freq 2>/dev/null)
-[ -z "$FREQ_MAX_MHZ" ] && FREQ_MAX_MHZ=null
 
 # ---------------------------------------------------------- static system info
 # All of this is dumb file parsing that works on any Linux box - no hard-coded
@@ -133,7 +189,7 @@ read -r CORES_PHYS THREADS SOCKETS < <(awk -F': ' '
     print c, th, s
   }' /proc/cpuinfo)
 
-dmi() { cat "/sys/devices/virtual/dmi/id/$1" 2>/dev/null; }
+dmi() { rd "/sys/devices/virtual/dmi/id/$1"; }
 _sv=$(squish "$(dmi sys_vendor)"); _pf=$(squish "$(dmi product_family)")
 _pn=$(squish "$(dmi product_name)"); _bn=$(squish "$(dmi board_name)")
 _pv=$(squish "$(dmi product_version)")
@@ -153,7 +209,17 @@ esac
 
 KERNEL=$(uname -r)
 ARCH=$(uname -m)
-DISTRO=$( . /etc/os-release 2>/dev/null; printf '%s' "${PRETTY_NAME:-${NAME:-Linux}}" )
+# /etc/os-release is shell syntax, but it is parsed rather than sourced: this
+# script never executes the contents of a file it only means to read.
+DISTRO=$(awk -F= '
+  $1 == "PRETTY_NAME" || $1 == "NAME" {
+    v = $2
+    gsub(/^[ \t]*["\x27]?|["\x27]?[ \t]*$/, "", v)
+    if ($1 == "PRETTY_NAME") { pretty = v } else if (name == "") { name = v }
+  }
+  END { print (pretty != "" ? pretty : (name != "" ? name : "Linux")) }
+' /etc/os-release 2>/dev/null)
+[ -n "$DISTRO" ] || DISTRO="Linux"
 
 # ---------------------------------------------------------------- memory
 read -r MEM_TOTAL MEM_AVAIL SWAP_TOTAL SWAP_FREE < <(
@@ -162,7 +228,7 @@ read -r MEM_TOTAL MEM_AVAIL SWAP_TOTAL SWAP_FREE < <(
     /^MemAvailable:/ { ma = $2 }
     /^SwapTotal:/    { st = $2 }
     /^SwapFree:/     { sf = $2 }
-    END { print mt, ma, st, sf }
+    END { print mt + 0, ma + 0, st + 0, sf + 0 }
   ' /proc/meminfo
 )
 read -r MEM_PCT MEM_USED_GIB MEM_TOTAL_GIB SWAP_PCT SWAP_USED_GIB SWAP_TOTAL_GIB < <(
@@ -178,7 +244,7 @@ read -r MEM_PCT MEM_USED_GIB MEM_TOTAL_GIB SWAP_PCT SWAP_USED_GIB SWAP_TOTAL_GIB
 SENSORS_JSON="{}"
 have sensors && SENSORS_JSON=$(sensors -j 2>/dev/null || echo '{}')
 # Guard against sensors emitting warnings that break JSON.
-echo "$SENSORS_JSON" | jq -e . >/dev/null 2>&1 || SENSORS_JSON="{}"
+jq -e . >/dev/null 2>&1 <<<"$SENSORS_JSON" || SENSORS_JSON="{}"
 
 # Pull the CPU/package temperature. Try AMD (k10temp: Tctl/Tdie/Tccd*), then
 # Intel (coretemp: "Package id *"), then fall back to the hottest generic
@@ -197,8 +263,8 @@ read -r CPU_TEMP CPU_TEMP_LABEL < <(
       end
   ' <<<"$SENSORS_JSON" 2>/dev/null
 )
-CPU_TEMP=$(awk -v v="${CPU_TEMP:-null}" 'BEGIN { if (v == "null" || v == "") print "null"; else printf "%.0f", v }')
-[ -z "$CPU_TEMP_LABEL" ] && CPU_TEMP_LABEL=SYS
+CPU_TEMP=$(awk -v v="$(num "${CPU_TEMP:-}")" 'BEGIN { if (v == "null") print "null"; else printf "%.0f", v }')
+[ -n "${CPU_TEMP_LABEL:-}" ] || CPU_TEMP_LABEL=SYS
 
 FAN_JSON=$(jq -c '
   [ .. | objects | to_entries[]
@@ -208,16 +274,18 @@ FAN_JSON=$(jq -c '
         rpm: ( [ .value | to_entries[] | select(.key|test("_input$")) | .value ] | (.[0] // 0) | floor ) }
     | select(.rpm > 0) ]
 ' <<<"$SENSORS_JSON" 2>/dev/null)
-[ -z "$FAN_JSON" ] && FAN_JSON="[]"
+[ -n "$FAN_JSON" ] || FAN_JSON="[]"
 
 # ---------------------------------------------------------------- GPUs
-GPU_JSON="[]"
+# Rows are "name<TAB>model<TAB>util<TAB>temp<TAB>mem_pct" and become JSON in a
+# single jq pass below; `squish` has already removed any tab from the model.
+gpu_rows=""
 
 # AMD (and any other) via the DRM sysfs busy counter.
 for dev in /sys/class/drm/card*/device; do
   [ -r "$dev/gpu_busy_percent" ] || continue
-  vendor=$(cat "$dev/vendor" 2>/dev/null)
-  busy=$(cat "$dev/gpu_busy_percent" 2>/dev/null || echo 0)
+  vendor=$(rd "$dev/vendor")
+  busy=$(num "$(rd "$dev/gpu_busy_percent")" 0)
   name="GPU"
   temp=null
 
@@ -246,9 +314,8 @@ for dev in /sys/class/drm/card*/device; do
                    <<<"$SENSORS_JSON" 2>/dev/null) ;;
     0x10de) name="NVIDIA" ;;
   esac
-  temp=$(awk -v v="${temp:-null}" 'BEGIN { if (v == "null" || v == "") print "null"; else printf "%.0f", v }')
-  GPU_JSON=$(jq -c --arg n "$name" --arg m "$model" --argjson b "${busy:-0}" --argjson t "$temp" \
-    '. + [{name:$n, model:(if $m == "" then null else $m end), util:$b, temp:$t, mem_pct:null}]' <<<"$GPU_JSON")
+  temp=$(awk -v v="$(num "${temp:-}")" 'BEGIN { if (v == "null") print "null"; else printf "%.0f", v }')
+  gpu_rows+="$name	$model	$busy	$temp	null"$'\n'
 done
 
 # NVIDIA only in --full mode: nvidia-smi can spin the dGPU up.
@@ -256,32 +323,54 @@ if [ "$FULL" = "1" ] && have nvidia-smi; then
   nv=$(nvidia-smi --query-gpu=utilization.gpu,temperature.gpu,memory.used,memory.total \
          --format=csv,noheader,nounits 2>/dev/null | head -1)
   nv_name=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)
-  nv_name=${nv_name# }; nv_name=${nv_name#NVIDIA }   # "NVIDIA GeForce RTX 2060" -> "GeForce RTX 2060"
+  nv_name=$(squish "${nv_name#NVIDIA }")   # "NVIDIA GeForce RTX 2060" -> "GeForce RTX 2060"
   if [ -n "$nv" ]; then
     IFS=', ' read -r nv_util nv_temp nv_mu nv_mt <<<"$nv"
-    nv_mem_pct=$(awk -v u="${nv_mu:-0}" -v t="${nv_mt:-0}" 'BEGIN { print (t > 0 ? int(100*u/t) : 0) }')
-    GPU_JSON=$(jq -c --arg nm "$nv_name" --argjson u "${nv_util:-0}" --argjson tp "${nv_temp:-0}" --argjson mp "$nv_mem_pct" \
-      '. + [{name:"NVIDIA", model:(if $nm == "" then null else $nm end), util:$u, temp:$tp, mem_pct:$mp}]' <<<"$GPU_JSON")
+    # nvidia-smi answers "[N/A]" for counters a card or driver does not expose
+    # (common on hybrid laptops); each field degrades to null on its own.
+    nv_util=$(num "${nv_util:-}")
+    nv_temp=$(num "${nv_temp:-}")
+    nv_mem_pct=$(awk -v u="$(num "${nv_mu:-}" -1)" -v t="$(num "${nv_mt:-}" -1)" 'BEGIN {
+      if (u < 0 || t <= 0) print "null"; else printf "%d", 100 * u / t
+    }')
+    gpu_rows+="NVIDIA	$nv_name	$nv_util	$nv_temp	$nv_mem_pct"$'\n'
   fi
 fi
 
+GPU_JSON=$(jq -Rsc '
+  def n: if . == "null" or . == "" then null else tonumber end;
+  split("\n") | map(select(length > 0) | split("\t")
+  | { name: .[0],
+      model: (if .[1] == "" then null else .[1] end),
+      util: (.[2] | n), temp: (.[3] | n), mem_pct: (.[4] | n) })
+' <<<"$gpu_rows" 2>/dev/null)
+[ -n "$GPU_JSON" ] || GPU_JSON="[]"
+
 # ---------------------------------------------------------------- disks
+# `target` comes last and is captured to end of line: a mount point may contain
+# spaces (a USB stick labelled "My Drive" lands on /run/media/<user>/My Drive),
+# and splitting on whitespace silently attributed its size to the wrong column.
 DISK_JSON=$(
-  df -B1 --output=source,target,pcent,used,size \
+  df -B1 --output=source,pcent,used,size,target \
      -x tmpfs -x devtmpfs -x efivarfs -x squashfs -x overlay -x ramfs 2>/dev/null \
-  | awk 'NR > 1 {
-      src = $1; tgt = $2; gsub(/%/, "", $3); pct = $3; used = $4; size = $5
-      if (seen[src]++) next            # btrfs subvolumes share a device
-      gsub(/,/, "", used); gsub(/,/, "", size)
-      dev = src; sub(/.*\//, "", dev); sub(/p?[0-9]+$/, "", dev)   # /dev/nvme0n1p2 -> nvme0n1
-      printf "%s{\"mount\":\"%s\",\"dev\":\"%s\",\"pct\":%d,\"used_gib\":%.1f,\"total_gib\":%.1f}",
-             (n++ ? "," : ""), tgt, dev, pct, used/1073741824, size/1073741824
-    }
-    END { }' \
-  | sed 's/^/[/; s/$/]/'
+  | tail -n +2 \
+  | jq -Rsc '
+      [ split("\n")[]
+        | select(length > 0)
+        | capture("^(?<src>.*?)[ \t]+(?<pct>[0-9]+)%[ \t]+(?<used>[0-9]+)[ \t]+(?<size>[0-9]+)[ \t]+(?<tgt>.+)$")
+        | { mount: .tgt,
+            src: .src,
+            dev: (.src | sub(".*/"; "") | sub("p?[0-9]+$"; "")),
+            pct: (.pct | tonumber),
+            used_gib: ((.used | tonumber) / 1073741824 * 10 | round / 10),
+            total_gib: ((.size | tonumber) / 1073741824 * 10 | round / 10) } ]
+      # btrfs subvolumes repeat one device; keep the first mount of each.
+      | reduce .[] as $d ({ seen: {}, out: [] };
+          if .seen[$d.src] then . else { seen: (.seen + { ($d.src): true }), out: (.out + [$d]) } end)
+      | .out | map(del(.src))
+    '
 )
-[ "$DISK_JSON" = "[]" ] || [ -n "$DISK_JSON" ] || DISK_JSON="[]"
-echo "$DISK_JSON" | jq -e . >/dev/null 2>&1 || DISK_JSON="[]"
+[ -n "$DISK_JSON" ] || DISK_JSON="[]"
 
 # --------------------------------------------------------- storage devices
 # Physical block devices with model / bus / capacity / temperature, straight
@@ -289,16 +378,17 @@ echo "$DISK_JSON" | jq -e . >/dev/null 2>&1 || DISK_JSON="[]"
 # Only gathered with --full (panel open), like the top-process list.
 STORAGE_JSON="[]"
 if [ "$FULL" = "1" ]; then
+  storage_rows=""
   for blk in /sys/block/*; do
     bn=${blk##*/}
     case "$bn" in loop*|ram*|zram*|md*|dm-*|sr*|fd*) continue ;; esac
-    sectors=$(cat "$blk/size" 2>/dev/null || echo 0)
-    [ "${sectors:-0}" -gt 0 ] 2>/dev/null || continue
+    sectors=$(num "$(rd "$blk/size")" 0)
+    [ "${sectors%%.*}" -gt 0 ] 2>/dev/null || continue
 
-    rota=$(cat "$blk/queue/rotational" 2>/dev/null || echo 0)
-    dmodel=$(squish "$(cat "$blk/device/model" 2>/dev/null)")
-    [ -z "$dmodel" ] && dmodel=$(squish "$(cat "$blk/device/name" 2>/dev/null)")
-    dvendor=$(squish "$(cat "$blk/device/vendor" 2>/dev/null)")
+    rota=$(rd "$blk/queue/rotational")
+    dmodel=$(squish "$(rd "$blk/device/model")")
+    [ -z "$dmodel" ] && dmodel=$(squish "$(rd "$blk/device/name")")
+    dvendor=$(squish "$(rd "$blk/device/vendor")")
     case "$dvendor" in ""|ATA|"Generic"|"Linux") ;; *) dmodel=$(squish "$dvendor $dmodel") ;; esac
     [ -z "$dmodel" ] && dmodel=$bn
 
@@ -312,26 +402,29 @@ if [ "$FULL" = "1" ]; then
     dtemp=null
     for h in "$blk"/device/hwmon*/temp1_input "$blk"/device/hwmon/hwmon*/temp1_input; do
       [ -r "$h" ] || continue
-      dtemp=$(awk -v v="$(cat "$h" 2>/dev/null)" 'BEGIN { if (v == "") print "null"; else printf "%.0f", v / 1000 }')
+      dtemp=$(awk -v v="$(num "$(rd "$h")")" 'BEGIN { if (v == "null") print "null"; else printf "%.0f", v / 1000 }')
       break
     done
 
     size_gb=$(awk -v s="$sectors" 'BEGIN { printf "%.1f", s * 512 / 1e9 }')
-    STORAGE_JSON=$(jq -c --arg name "$bn" --arg model "$dmodel" --arg tran "$tran" \
-      --arg kind "$kind" --argjson size_gb "$size_gb" --argjson temp "$dtemp" \
-      '. + [{name:$name, model:$model, tran:$tran, kind:$kind, size_gb:$size_gb, temp:$temp}]' \
-      <<<"$STORAGE_JSON")
+    storage_rows+="$bn	$dmodel	$tran	$kind	$size_gb	$dtemp"$'\n'
   done
-  echo "$STORAGE_JSON" | jq -e . >/dev/null 2>&1 || STORAGE_JSON="[]"
+  STORAGE_JSON=$(jq -Rsc '
+    split("\n") | map(select(length > 0) | split("\t")
+    | { name: .[0], model: .[1], tran: .[2], kind: .[3],
+        size_gb: (.[4] | tonumber),
+        temp: (if .[5] == "null" then null else (.[5] | tonumber) end) })
+  ' <<<"$storage_rows" 2>/dev/null)
+  [ -n "$STORAGE_JSON" ] || STORAGE_JSON="[]"
 fi
 
 # ---------------------------------------------------------------- battery
 BAT_JSON=null
 for bat in /sys/class/power_supply/BAT*; do
   [ -r "$bat/capacity" ] || continue
-  cap=$(cat "$bat/capacity" 2>/dev/null)
-  status=$(cat "$bat/status" 2>/dev/null)
-  BAT_JSON=$(jq -nc --argjson c "${cap:-0}" --arg s "${status:-Unknown}" '{pct:$c, status:$s}')
+  cap=$(num "$(rd "$bat/capacity")" 0)
+  status=$(rd "$bat/status")
+  BAT_JSON=$(jq -nc --argjson c "$cap" --arg s "${status:-Unknown}" '{pct:$c, status:$s}')
   break
 done
 
@@ -344,52 +437,56 @@ UPTIME_STR=$(awk '{ s = int($1)
 }' /proc/uptime)
 
 # ---------------------------------------------------------------- top processes
+# A process name is attacker-influenced text: any user can run a binary called
+# `a"b`, and comm keeps spaces (Firefox's "Web Content"). jq does the quoting,
+# and the percentage is anchored to the end of the line so a name with spaces
+# survives intact instead of being cut at the first one.
 TOP_CPU_JSON="[]"
 TOP_MEM_JSON="[]"
+top_procs() {
+  ps -eo "comm,$1" --sort="-$1" --no-headers 2>/dev/null | head -5 | jq -Rsc '
+    split("\n") | map(select(length > 0)
+    | capture("^(?<name>.*\\S)[ \t]+(?<pct>[0-9]+(\\.[0-9]+)?)[ \t]*$")
+    | { name: .name, pct: (.pct | tonumber) })'
+}
 if [ "$FULL" = "1" ]; then
-  TOP_CPU_JSON=$(ps -eo comm,%cpu --sort=-%cpu --no-headers 2>/dev/null | head -5 \
-    | awk '{ printf "%s{\"name\":\"%s\",\"pct\":%.1f}", (n++ ? "," : ""), $1, $2 }' \
-    | sed 's/^/[/; s/$/]/')
-  TOP_MEM_JSON=$(ps -eo comm,%mem --sort=-%mem --no-headers 2>/dev/null | head -5 \
-    | awk '{ printf "%s{\"name\":\"%s\",\"pct\":%.1f}", (n++ ? "," : ""), $1, $2 }' \
-    | sed 's/^/[/; s/$/]/')
-  echo "$TOP_CPU_JSON" | jq -e . >/dev/null 2>&1 || TOP_CPU_JSON="[]"
-  echo "$TOP_MEM_JSON" | jq -e . >/dev/null 2>&1 || TOP_MEM_JSON="[]"
+  TOP_CPU_JSON=$(top_procs %cpu); [ -n "$TOP_CPU_JSON" ] || TOP_CPU_JSON="[]"
+  TOP_MEM_JSON=$(top_procs %mem); [ -n "$TOP_MEM_JSON" ] || TOP_MEM_JSON="[]"
 fi
 
 # ---------------------------------------------------------------- assemble
 jq -nc \
-  --argjson cpu_pct "${CPU_PCT:-0}" \
-  --argjson cpu_cores "${CPU_CORES_JSON:-[]}" \
-  --argjson ncpu "${NCPU:-1}" \
-  --argjson load "[${LOAD1:-0},${LOAD5:-0},${LOAD15:-0}]" \
-  --argjson freq_mhz "${FREQ_MHZ:-null}" \
-  --argjson freq_max_mhz "${FREQ_MAX_MHZ:-null}" \
+  --argjson cpu_pct "$(num "${CPU_PCT:-}" 0)" \
+  --argjson cpu_cores "$CPU_CORES_JSON" \
+  --argjson ncpu "$(num "${NCPU:-}" 1)" \
+  --argjson load "[$(num "${LOAD1:-}" 0),$(num "${LOAD5:-}" 0),$(num "${LOAD15:-}" 0)]" \
+  --argjson freq_mhz "$(num "${FREQ_MHZ:-}")" \
+  --argjson freq_max_mhz "$(num "${FREQ_MAX_MHZ:-}")" \
   --arg cpu_model "${CPU_MODEL:-}" \
-  --argjson cores_phys "${CORES_PHYS:-0}" \
-  --argjson threads "${THREADS:-0}" \
-  --argjson sockets "${SOCKETS:-1}" \
+  --argjson cores_phys "$(num "${CORES_PHYS:-}" 0)" \
+  --argjson threads "$(num "${THREADS:-}" 0)" \
+  --argjson sockets "$(num "${SOCKETS:-}" 1)" \
   --arg host_model "${HOST_MODEL:-}" \
   --arg kernel "${KERNEL:-}" \
   --arg arch "${ARCH:-}" \
   --arg distro "${DISTRO:-}" \
-  --argjson storage "${STORAGE_JSON:-[]}" \
-  --argjson mem_pct "${MEM_PCT:-0}" \
-  --argjson mem_used_gib "${MEM_USED_GIB:-0}" \
-  --argjson mem_total_gib "${MEM_TOTAL_GIB:-0}" \
-  --argjson swap_pct "${SWAP_PCT:-0}" \
-  --argjson swap_used_gib "${SWAP_USED_GIB:-0}" \
-  --argjson swap_total_gib "${SWAP_TOTAL_GIB:-0}" \
-  --argjson temp_c "${CPU_TEMP:-null}" \
+  --argjson storage "$STORAGE_JSON" \
+  --argjson mem_pct "$(num "${MEM_PCT:-}" 0)" \
+  --argjson mem_used_gib "$(num "${MEM_USED_GIB:-}" 0)" \
+  --argjson mem_total_gib "$(num "${MEM_TOTAL_GIB:-}" 0)" \
+  --argjson swap_pct "$(num "${SWAP_PCT:-}" 0)" \
+  --argjson swap_used_gib "$(num "${SWAP_USED_GIB:-}" 0)" \
+  --argjson swap_total_gib "$(num "${SWAP_TOTAL_GIB:-}" 0)" \
+  --argjson temp_c "$(num "${CPU_TEMP:-}")" \
   --arg temp_label "${CPU_TEMP_LABEL:-SYS}" \
-  --argjson fans "${FAN_JSON:-[]}" \
-  --argjson gpus "${GPU_JSON:-[]}" \
-  --argjson disks "${DISK_JSON:-[]}" \
-  --argjson net "${NET_JSON:-[]}" \
-  --argjson battery "${BAT_JSON:-null}" \
+  --argjson fans "$FAN_JSON" \
+  --argjson gpus "$GPU_JSON" \
+  --argjson disks "$DISK_JSON" \
+  --argjson net "$NET_JSON" \
+  --argjson battery "$BAT_JSON" \
   --arg uptime "${UPTIME_STR:-?}" \
-  --argjson top_cpu "${TOP_CPU_JSON:-[]}" \
-  --argjson top_mem "${TOP_MEM_JSON:-[]}" \
+  --argjson top_cpu "$TOP_CPU_JSON" \
+  --argjson top_mem "$TOP_MEM_JSON" \
   --argjson full "$FULL" \
   '{
     cpu_pct: $cpu_pct, cpu_cores: $cpu_cores, ncpu: $ncpu, load: $load,

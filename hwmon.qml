@@ -14,6 +14,9 @@ Panel {
   id: root
   moduleName: "io.github.grootaiinfinity.hwmon"
   ipcTarget: "io.github.grootaiinfinity.hwmon"
+  // The base Panel would install its own handler for the same target, and a
+  // target only gets one; own it here so the bar readout is scriptable too.
+  manageIpc: false
 
   // Resolve the bundled backend script relative to this plugin's own folder,
   // wherever `omarchy plugin add` installed it.
@@ -22,10 +25,27 @@ Panel {
     return dir.replace(/^file:\/\//, "").replace(/\/$/, "")
   }
   readonly property string script: pluginDir + "/hwmon.sh"
-  readonly property string stateFile: (Quickshell.env("XDG_STATE_HOME") || (Quickshell.env("HOME") + "/.local/state")) + "/omarchy-hwmon.expanded"
+
+  // Where the runtime expand/collapse choice is remembered. This is the only
+  // file the plugin writes; it never touches shell.json or any other config the
+  // user owns. Empty when the environment gives us nowhere to put it, in which
+  // case the toggle simply does not persist.
+  readonly property string stateDir: {
+    var base = Quickshell.env("XDG_STATE_HOME") || ""
+    if (!base) {
+      var home = Quickshell.env("HOME") || ""
+      base = home ? home + "/.local/state" : ""
+    }
+    return base ? base.replace(/\/$/, "") + "/omarchy-hwmon" : ""
+  }
+  readonly property string statePath: stateDir ? stateDir + "/expanded" : ""
 
   property var stats: ({})
-  property bool expanded: setting("expanded", false)
+  property bool expanded: false
+  // Set once the saved toggle has been resolved, so the manifest default can't
+  // land on top of it. `settings` arrives a tick after Component.onCompleted,
+  // and the file read finishes whenever it finishes.
+  property bool stateResolved: false
 
   readonly property int cpuPct: Math.round(Number(stats.cpu_pct) || 0)
   readonly property int memPct: Math.round(Number(stats.mem_pct) || 0)
@@ -37,13 +57,29 @@ Panel {
   readonly property var battery: stats.battery || null
   readonly property real gpuPct: gpus.length > 0 ? Math.round(Number(gpus[0].util) || 0) : 0
 
+  // The backend reports its own failures in-band (no jq, for example) rather
+  // than leaving the widget showing a confident 0%.
+  readonly property string statsError: (stats && stats.error) ? String(stats.error) : ""
+  // Epoch ms of the last sample that parsed. Staleness - rather than the exit
+  // code - is what the readout is judged on: a backend that is missing, has
+  // crashed, is wedged, or prints something unreadable all look the same from
+  // here, and all of them mean the numbers on screen are no longer current.
+  property double lastSampleMs: 0
+  property bool stalled: false
+  readonly property bool degraded: statsError !== "" || stalled
+  readonly property int staleAfterMs: 12000
+
   // Hottest thing worth alarming about, for the bar glyph tint.
-  readonly property bool alarm: cpuPct >= 90 || memPct >= 90 || (tempC !== null && tempC >= 88)
+  readonly property bool alarm: !degraded && (cpuPct >= 90 || memPct >= 90 || (tempC !== null && tempC >= 88))
 
   readonly property color fg: Color.popups.text
 
   readonly property string tooltipText: {
     var lines = []
+    if (degraded) {
+      lines.push(statsError !== "" ? statsError : "hwmon: the last sample did not finish")
+      lines.push("")
+    }
     lines.push("CPU  " + cpuPct + "%" + (stats.freq_mhz ? "  ·  " + fmtGhz(stats.freq_mhz) : "")
                + (stats.load ? "  ·  load " + stats.load[0] : ""))
     lines.push("RAM  " + memPct + "%  ·  " + fmt1(stats.mem_used_gib) + " / " + fmt1(stats.mem_total_gib) + " GiB")
@@ -89,30 +125,76 @@ Panel {
   }
 
   function refresh() {
+    // One sample at a time. The watchdog below makes sure a wedged backend
+    // (a hung nvidia-smi, an unresponsive sensor) releases the slot instead of
+    // freezing the readout for the rest of the session.
     if (statsProc.running) return
     statsProc.command = root.opened
       ? [root.script, "stats", "--full"]
       : [root.script, "stats"]
     statsProc.running = true
+    sampleWatchdog.restart()
   }
 
   function parseStats(text) {
     try {
       var data = JSON.parse(text)
-      if (data && typeof data === "object") root.stats = data
+      if (data && typeof data === "object") {
+        root.lastSampleMs = Date.now()
+        root.stalled = false
+        root.stats = data
+      }
     } catch (e) {
       // Transient parse failures (sensors warning on stderr etc.) - keep last good.
     }
   }
 
+  // Persisting the toggle goes through FileView, so the path is handed to the
+  // file API as data. It is never spliced into a shell command line, where a
+  // quote in $XDG_STATE_HOME or $HOME would end the quoting and turn the rest
+  // of the value into commands run by the shell.
   function setExpanded(v) {
+    if (root.expanded === v) return
     root.expanded = v
-    writeStateProc.command = ["bash", "-c", "mkdir -p \"$(dirname '" + root.stateFile + "')\" && printf '%s' " + (v ? "1" : "0") + " > '" + root.stateFile + "'"]
-    if (!writeStateProc.running) writeStateProc.running = true
+    root.stateResolved = true
+    if (root.statePath === "") return
+    stateFile.setText(v ? "1" : "0")
+  }
+
+  function applyState(raw) {
+    var t = String(raw).trim()
+    if (t === "0" || t === "1") {
+      root.expanded = (t === "1")
+      root.stateResolved = true
+      return
+    }
+    // Nothing saved yet: fall back to the manifest setting, which the shell
+    // injects a tick after onCompleted - hence the deferred read.
+    Qt.callLater(function () {
+      if (!root.stateResolved) {
+        root.expanded = root.setting("expanded", false)
+        root.stateResolved = true
+      }
+    })
+  }
+
+  IpcHandler {
+    target: root.ipcTarget
+
+    function open(): void { root.open() }
+    function close(): void { root.close() }
+    function show(): void { root.open() }
+    function hide(): void { root.close() }
+    function toggle(): void { root.toggle() }
+
+    // Bar readout, same thing right-click and scroll do.
+    function expand(): void { root.setExpanded(true) }
+    function collapse(): void { root.setExpanded(false) }
+    function toggleExpanded(): void { root.setExpanded(!root.expanded) }
   }
 
   Component.onCompleted: {
-    loadStateProc.running = true
+    lastSampleMs = Date.now()
     refresh()
   }
 
@@ -123,30 +205,56 @@ Panel {
     running: true
     repeat: true
     triggeredOnStart: true
-    onTriggered: root.refresh()
+    onTriggered: {
+      root.refresh()
+      root.stalled = (Date.now() - root.lastSampleMs) > root.staleAfterMs
+    }
+  }
+
+  Timer {
+    id: sampleWatchdog
+    interval: 10000
+    repeat: false
+    onTriggered: {
+      // Free the slot so the next tick can sample again; the poll timer above
+      // decides when that counts as stale.
+      if (statsProc.running) statsProc.running = false
+    }
   }
 
   Process {
     id: statsProc
+    onExited: sampleWatchdog.stop()
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: root.parseStats(text)
     }
   }
 
-  Process {
-    id: loadStateProc
-    command: ["bash", "-c", "cat '" + root.stateFile + "' 2>/dev/null"]
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: {
-        var t = String(text).trim()
-        if (t === "0" || t === "1") root.expanded = (t === "1")
-      }
+  FileView {
+    id: stateFile
+    path: root.statePath
+    watchChanges: true            // a second bar on another monitor stays in sync
+    atomicWrites: true
+    printErrors: false
+    onLoaded: root.applyState(text())
+    onLoadFailed: root.applyState("")
+    onFileChanged: reload()
+    // First run: ~/.local/state/omarchy-hwmon does not exist yet and FileView
+    // will not create it. Make it once, then retry the save.
+    onSaveFailed: {
+      if (root.statePath === "" || mkStateDirProc.running || stateFile.dirRetried) return
+      stateFile.dirRetried = true
+      mkStateDirProc.command = ["mkdir", "-p", "--", root.stateDir]
+      mkStateDirProc.running = true
     }
+    property bool dirRetried: false
   }
 
-  Process { id: writeStateProc }
+  Process {
+    id: mkStateDirProc
+    onExited: if (root.statePath !== "") stateFile.setText(root.expanded ? "1" : "0")
+  }
 
   // ================================================================ bar button
   Item {
@@ -163,29 +271,29 @@ Panel {
 
       BarMetric {
         glyph: "" // nf-oct-cpu
-        value: root.cpuPct + "%"
-        hot: root.cpuPct >= 90
+        value: root.degraded ? "--" : root.cpuPct + "%"
+        hot: !root.degraded && root.cpuPct >= 90
       }
       BarMetric {
         visible: root.expanded
         glyph: "󰍛" // nf-md-memory
-        value: root.memPct + "%"
-        hot: root.memPct >= 90
+        value: root.degraded ? "--" : root.memPct + "%"
+        hot: !root.degraded && root.memPct >= 90
       }
       BarMetric {
-        visible: root.tempC !== null
+        visible: root.tempC !== null && !root.degraded
         glyph: "󰔏" // nf-md-thermometer
         value: (root.tempC === null ? "--" : root.tempC + "°")
         hot: root.tempC !== null && root.tempC >= 88
       }
       BarMetric {
-        visible: root.expanded && root.gpus.length > 0
+        visible: root.expanded && !root.degraded && root.gpus.length > 0
         glyph: "󰢮" // nf-md-expansion_card_variant
         value: root.gpuPct + "%"
         hot: root.gpuPct >= 90
       }
       BarMetric {
-        visible: root.expanded && root.battery !== null
+        visible: root.expanded && !root.degraded && root.battery !== null
         glyph: "󰁹" // nf-md-battery
         value: (root.battery ? root.battery.pct + "%" : "")
         hot: root.battery !== null && root.battery.pct <= 15
@@ -282,6 +390,24 @@ Panel {
                 color: root.fg
                 font.family: root.bar ? root.bar.fontFamily : Style.font.family
                 font.pixelSize: Style.font.display
+              }
+            }
+          }
+
+          // -------------------------------------------------- Backend trouble
+          // Say what went wrong instead of leaving the panel full of zeroes.
+          Item {
+            width: parent.width
+            visible: root.degraded
+            implicitHeight: errCol.implicitHeight
+            Column {
+              id: errCol
+              width: parent.width
+              spacing: Style.space(4)
+              InfoRow {
+                label: "Status"
+                value: root.statsError !== "" ? root.statsError
+                     : "The last sample did not finish in time and was stopped."
               }
             }
           }

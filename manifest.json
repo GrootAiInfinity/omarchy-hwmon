@@ -1,9 +1,8 @@
 {
-  "$schema": "https://raw.githubusercontent.com/omarchy/omarchy/main/schemas/plugin.json",
   "schemaVersion": 1,
   "id": "io.github.grootaiinfinity.hwmon",
   "name": "Hardware Monitor",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": "groot",
   "license": "MIT",
   "description": "Live CPU / temperature readout in the bar; click for a detailed system panel (CPU cores, memory, thermals, GPUs, disks, network, top processes, battery).",
@@ -16,7 +15,7 @@
   },
   "barWidget": {
     "displayName": "Hardware Monitor",
-    "description": "CPU% + temperature in the bar. Right-click / scroll expands it to add memory, GPU and battery; left-click opens the full system panel.",
+    "description": "CPU% + temperature in the bar. Right-click / scroll expands it to add memory, GPU and battery; left-click opens the full system panel. Reads kernel sysfs/procfs only - no elevated privileges, no network access.",
     "category": "System",
     "allowMultiple": false,
     "defaultSection": "right",
