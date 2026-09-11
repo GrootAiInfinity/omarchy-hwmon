@@ -66,6 +66,10 @@ the widget shows when everything is healthy.
 
 ### Changed
 
+- Screenshots no longer show this machine. `preview.png` and `docs/panel.png`
+  were cropped to the bar readout and the CPU/memory section; the panel
+  sections that name the host, CPU, GPUs, drives, mounts, network interface and
+  running processes are gone from both, and PNG metadata chunks are stripped.
 - The backend runs with `LC_ALL=C`, so a non-English locale cannot change the
   decimal separator or the wording of the tool output it parses.
 - Fewer subprocesses per sample: each of the network, GPU, storage, disk and

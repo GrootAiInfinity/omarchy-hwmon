@@ -74,8 +74,8 @@ num() {
 squish() { awk '{ $1 = $1; print }' <<<"$*"; }
 
 # Human-friendly GPU model name for a PCI address (e.g. 0000:06:00.0), via
-# lspci: "Renoir [Radeon Vega Series / Radeon Vega Mobile Series]" -> "Radeon
-# Vega Series", "TU106M [GeForce RTX 2060 Mobile]" -> "GeForce RTX 2060 Mobile".
+# lspci: "Cezanne [Radeon Vega Series / Radeon Mobile Series]" -> "Radeon Vega
+# Series", "GA106M [GeForce RTX 3060 Mobile]" -> "GeForce RTX 3060 Mobile".
 # Prints nothing if lspci is missing or the slot has no readable name.
 gpu_model() {
   have lspci || return 0
@@ -84,7 +84,7 @@ gpu_model() {
   [ -n "$dev" ] || return 0
   # Prefer the marketing name lspci puts in [brackets] after the codename.
   [[ $dev =~ \[([^]]+)\] ]] && dev=${BASH_REMATCH[1]}
-  dev=${dev%% / *}          # collapse "Radeon Vega Series / ..." to the first
+  dev=${dev%% / *}          # collapse "Radeon ... / Radeon ..." to the first
   printf '%s' "$(squish "$dev")"
 }
 
@@ -323,7 +323,7 @@ if [ "$FULL" = "1" ] && have nvidia-smi; then
   nv=$(nvidia-smi --query-gpu=utilization.gpu,temperature.gpu,memory.used,memory.total \
          --format=csv,noheader,nounits 2>/dev/null | head -1)
   nv_name=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)
-  nv_name=$(squish "${nv_name#NVIDIA }")   # "NVIDIA GeForce RTX 2060" -> "GeForce RTX 2060"
+  nv_name=$(squish "${nv_name#NVIDIA }")   # "NVIDIA GeForce RTX 3060" -> "GeForce RTX 3060"
   if [ -n "$nv" ]; then
     IFS=', ' read -r nv_util nv_temp nv_mu nv_mt <<<"$nv"
     # nvidia-smi answers "[N/A]" for counters a card or driver does not expose

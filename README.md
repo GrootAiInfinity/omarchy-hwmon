@@ -6,7 +6,15 @@ detailed system panel on click.
 
 Plugin id: `io.github.grootaiinfinity.hwmon` · Kind: `bar-widget` · License: MIT
 
-![panel](docs/panel.png)
+![the widget in the bar](docs/bar.png)
+
+![the CPU section of the detail panel](docs/panel.png)
+
+The screenshots show the bar readout and one section of the detail panel. The
+other sections — system summary, thermals and fans, GPUs, storage, disks,
+network, top processes, battery — are left out on purpose: a screenshot of them
+is a photograph of the author's hardware and running software, not information
+about the plugin. The full list of what the panel shows is below.
 
 ## Features
 
@@ -20,7 +28,7 @@ Plugin id: `io.github.grootaiinfinity.hwmon` · Kind: `bar-widget` · License: M
   - Memory and swap
   - Thermals and fan speeds
   - Per-GPU utilisation meters, each labelled with its model name (e.g.
-    `Radeon Vega Series`, `GeForce RTX 2060`) — AMD/Intel via the
+    `Radeon RX 6600`, `GeForce RTX 3060`) — AMD/Intel via the
     `gpu_busy_percent` DRM counter, NVIDIA via `nvidia-smi`
   - Storage devices: model name, bus (NVMe / SATA / USB), capacity, temperature
   - Disk usage per mount (with the backing device)
