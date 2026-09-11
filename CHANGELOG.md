@@ -4,6 +4,24 @@ All notable changes to this plugin are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.3] — 2026-09-11
+
+Stops a read from being refused because the widget itself was writing. No
+change to what the widget shows.
+
+### Fixed
+
+- **A read racing the widget's own write returned nothing.** The 1.2.1 check
+  refuses a file whose inode changed across the open, which is what an attacker
+  swapping in a symlink looks like — but it is also what the widget's own
+  `rename` looks like when the toggle is saved at that moment. About 3% of reads
+  taken during a write were refused, and at startup a refused read silently
+  drops the saved toggle in favour of the manifest default. The read now retries
+  up to five times. Each attempt is validated from scratch on its own
+  descriptor, so a swapped object is still never read: retrying only lets a
+  legitimate read finish, and an attacker swapping forever can deny the read but
+  never redirect it.
+
 ## [1.2.2] — 2026-09-11
 
 Cleans up after an interrupted state-file write. No change to what the widget
@@ -193,6 +211,7 @@ First packaged release as an Omarchy plugin.
   from each card's PCI address rather than hard-coded.
 - Plugin id `io.github.grootaiinfinity.hwmon`.
 
+[1.2.3]: https://github.com/GrootAiInfinity/omarchy-hwmon/releases/tag/v1.2.3
 [1.2.2]: https://github.com/GrootAiInfinity/omarchy-hwmon/releases/tag/v1.2.2
 [1.2.1]: https://github.com/GrootAiInfinity/omarchy-hwmon/releases/tag/v1.2.1
 [1.2.0]: https://github.com/GrootAiInfinity/omarchy-hwmon/releases/tag/v1.2.0

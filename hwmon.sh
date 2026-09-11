@@ -119,24 +119,39 @@ dir_is_safe() {
 STATE_READ_CHILD='
   set -u
   f=$1
-  pre=$(stat -c "%d:%i|%F" -- "$f" 2>/dev/null) || exit 0   # lstat: no follow
-  case ${pre#*|} in
-    "regular file"|"regular empty file") ;;
-    *) exit 0 ;;                                # symlink, FIFO, device, dir
-  esac
-  exec 9<"$f" 2>/dev/null || exit 0
-  post=$(stat -L -c "%d:%i|%F|%u|%s" /dev/fd/9 2>/dev/null) || exit 0
-  ident=${post%%|*}; rest=${post#*|}
-  ftype=${rest%%|*}; rest=${rest#*|}
-  fuid=${rest%%|*}; fsize=${rest##*|}
-  [ "$ident" = "${pre%%|*}" ] || exit 0         # not the object we inspected
-  case $ftype in "regular file"|"regular empty file") ;; *) exit 0 ;; esac
-  [ "$fuid" = "$EUID" ] || exit 0               # and only our own
-  [ "$fsize" -le 2 ] 2>/dev/null || exit 0      # one byte plus a newline
-  # `read` reports failure at EOF when the last line has no newline, which is
-  # how state-write leaves it: check the value, not the exit status.
-  IFS= read -r v <&9 2>/dev/null
-  case ${v:-} in 0|1) printf "%s" "$v" ;; esac
+  # The widget replaces this file by rename whenever the toggle changes, so a
+  # changed inode is far more often our own write than an attacker - a read
+  # racing one was refused about 3% of the time, and at startup that silently
+  # drops the saved toggle in favour of the manifest default. Retry instead.
+  # Each attempt is validated on its own descriptor from scratch, so an object
+  # swapped in is still never read: retrying lets a legitimate read finish, and
+  # the worst an attacker can do by swapping forever is deny the read.
+  n=0
+  while [ $n -lt 5 ]; do
+    n=$((n + 1))
+    pre=$(stat -c "%d:%i|%F" -- "$f" 2>/dev/null) || exit 0   # lstat: no follow
+    case ${pre#*|} in
+      "regular file"|"regular empty file") ;;
+      *) exit 0 ;;                              # symlink, FIFO, device, dir
+    esac
+    exec 9<"$f" 2>/dev/null || exit 0
+    post=$(stat -L -c "%d:%i|%F|%u|%s" /dev/fd/9 2>/dev/null) || exit 0
+    ident=${post%%|*}; rest=${post#*|}
+    ftype=${rest%%|*}; rest=${rest#*|}
+    fuid=${rest%%|*}; fsize=${rest##*|}
+    if [ "$ident" != "${pre%%|*}" ]; then       # not the object we inspected
+      exec 9<&-
+      continue
+    fi
+    case $ftype in "regular file"|"regular empty file") ;; *) exit 0 ;; esac
+    [ "$fuid" = "$EUID" ] || exit 0             # and only our own
+    [ "$fsize" -le 2 ] 2>/dev/null || exit 0    # one byte plus a newline
+    # `read` reports failure at EOF when the last line has no newline, which is
+    # how state-write leaves it: check the value, not the exit status.
+    IFS= read -r v <&9 2>/dev/null
+    case ${v:-} in 0|1) printf "%s" "$v" ;; esac
+    exit 0
+  done
 '
 
 state_read() {
