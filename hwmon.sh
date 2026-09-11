@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/bash
 # Hardware monitor backend for the Omarchy bar widget (hwmon.qml).
 #
 #   hwmon.sh stats          Lightweight sample: CPU, memory, load, temps, fans,
@@ -6,6 +6,9 @@
 #   hwmon.sh stats --full   Everything above plus NVIDIA GPU (nvidia-smi, which
 #                           can wake the dGPU), physical storage devices and the
 #                           top processes by CPU/RAM.
+#   hwmon.sh state-read     Print the saved bar-readout choice (0 or 1), if the
+#                           state file passes its safety checks.
+#   hwmon.sh state-write 0|1  Save that choice.
 #   hwmon.sh --help         Usage.
 #
 # Output is a single line of JSON on stdout. Missing metrics are emitted as
@@ -14,30 +17,125 @@
 # `num`, so no reading from /proc, /sys, `ps` or `df` can produce broken JSON.
 #
 # The script reads only kernel-provided files and runs only read-only tools. It
-# never writes anything, never asks for elevated privileges, and never touches
-# the network.
+# asks for no elevated privileges, never touches the network, and writes exactly
+# one file: the state file handled by state-write below.
+#
+# The interpreter is an absolute path and PATH is replaced with root-owned
+# system directories before any helper runs, so a binary planted earlier in the
+# caller's PATH cannot stand in for jq, sensors, df, ps, nvidia-smi or lspci.
+# The widget additionally launches this script with an empty environment.
 
 set -u
+
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
 
 # Parsing tool output is only deterministic in the C locale: another locale can
 # translate df's header, or make awk/ps print "1,5" where JSON needs "1.5".
 export LC_ALL=C
 
+umask 077
+
 SAMPLE_INTERVAL=0.35
+
+# Nothing this script reads is supposed to be large, and every one of these
+# producers is external. Cap each one where it is produced: the QML collector
+# on the other end buffers whatever arrives with no limit of its own, so a
+# runaway or hostile helper would otherwise grow the shell's heap unbounded.
+MAX_SENSORS=262144        # sensors -j, the biggest legitimate input
+MAX_SMI=4096              # four short CSV fields
+MAX_LSPCI=65536           # one device line
+MAX_DF=65536              # one line per mount
+MAX_PS=16384              # five lines, twice
+MAX_OUTPUT=1048576        # this script's own stdout
+CMD_TIMEOUT=5             # per external helper; the widget also has a deadline
+
+# Run an external helper under a time limit. A sensor that never answers - a
+# wedged i2c bus, a dGPU that will not wake - stops the sample instead of
+# holding the single in-flight slot until the widget's watchdog fires.
+run() { timeout -s KILL "$CMD_TIMEOUT" "$@"; }
 
 usage() {
   cat <<'EOF'
 Usage: hwmon.sh [stats] [--full]
+       hwmon.sh state-read
+       hwmon.sh state-write 0|1
        hwmon.sh --help
 
-  stats     Emit one line of JSON describing the current hardware state.
-  --full    Also collect NVIDIA GPU stats, storage devices and top processes.
-            Costs more and can wake a sleeping discrete GPU, so the widget
-            only asks for it while its panel is open.
+  stats        Emit one line of JSON describing the current hardware state.
+  --full       Also collect NVIDIA GPU stats, storage devices and top processes.
+               Costs more and can wake a sleeping discrete GPU, so the widget
+               only asks for it while its panel is open.
+  state-read   Print the saved bar-readout choice, or nothing.
+  state-write  Save it.
 EOF
 }
 
+# ------------------------------------------------------------------ state file
+# Where the expand/collapse choice lives. The widget used to read and write this
+# through the QML file API, which has no way to ask whether the path is a
+# regular file, who owns it, or how big it is - so a symlink left at that path
+# would have been followed and its contents handed to the shell process. Both
+# directions now go through here, where those questions can be answered.
+
+state_path() {
+  local base=${XDG_STATE_HOME:-}
+  [ -n "$base" ] || base=${HOME:-}/.local/state
+  [ "$base" = "/.local/state" ] && return 1     # no HOME: nowhere to persist
+  printf '%s/omarchy-hwmon/expanded' "${base%/}"
+}
+
+# A directory is only usable if it is a real directory we own that nobody else
+# can write to.
+dir_is_safe() {
+  local d=$1 perm
+  [ -L "$d" ] && return 1
+  [ -d "$d" ] || return 1
+  [ -O "$d" ] || return 1
+  perm=$(stat -c %a -- "$d" 2>/dev/null) || return 1
+  case "$perm" in *[2367]) return 1 ;; esac     # group- or other-writable
+  return 0
+}
+
+state_read() {
+  local f d v size
+  f=$(state_path) || return 0
+  d=${f%/*}
+  dir_is_safe "$d" || return 0
+  [ -L "$f" ] && return 0                       # never follow a planted link
+  [ -f "$f" ] || return 0                       # regular files only
+  [ -O "$f" ] || return 0                       # and only our own
+  size=$(stat -c %s -- "$f" 2>/dev/null) || return 0
+  [ "$size" -le 2 ] 2>/dev/null || return 0     # one byte plus a newline
+  # `read` reports failure at EOF when the last line has no newline, which is
+  # exactly how state-write leaves it - so check the value, not read's status.
+  IFS= read -r v <"$f" 2>/dev/null
+  case "$v" in 0|1) printf '%s' "$v" ;; esac
+}
+
+state_write() {
+  local v=$1 f d tmp
+  case "$v" in 0|1) ;; *) printf 'hwmon.sh: state-write takes 0 or 1\n' >&2; exit 2 ;; esac
+  f=$(state_path) || exit 1
+  d=${f%/*}
+  [ -L "$d" ] && { printf 'hwmon.sh: state directory is a symlink, refusing\n' >&2; exit 1; }
+  [ -d "$d" ] || mkdir -m 700 -p -- "$d" 2>/dev/null
+  dir_is_safe "$d" || { printf 'hwmon.sh: state directory is not a private directory we own\n' >&2; exit 1; }
+  # Drop whatever is sitting there first, so a symlink planted at the path
+  # cannot redirect the write, then move the new file into place atomically.
+  [ -e "$f" ] || [ -L "$f" ] && rm -f -- "$f"
+  tmp=$d/.expanded.$$
+  rm -f -- "$tmp"
+  ( umask 077; printf '%s' "$v" >"$tmp" ) || exit 1
+  mv -f -- "$tmp" "$f" || { rm -f -- "$tmp"; exit 1; }
+}
+
 FULL=0
+case "${1:-}" in
+  state-read)  state_read; exit 0 ;;
+  state-write) state_write "${2:-}"; exit 0 ;;
+esac
+
 for arg in "$@"; do
   case "$arg" in
     stats)      ;;
@@ -80,7 +178,7 @@ squish() { awk '{ $1 = $1; print }' <<<"$*"; }
 gpu_model() {
   have lspci || return 0
   local dev
-  dev=$(lspci -mm -s "$1" 2>/dev/null | head -1 | grep -oE '"[^"]*"' | sed -n '3p' | tr -d '"')
+  dev=$(run lspci -mm -s "$1" 2>/dev/null | head -c "$MAX_LSPCI" | head -1 | grep -oE '"[^"]*"' | sed -n '3p' | tr -d '"')
   [ -n "$dev" ] || return 0
   # Prefer the marketing name lspci puts in [brackets] after the codename.
   [[ $dev =~ \[([^]]+)\] ]] && dev=${BASH_REMATCH[1]}
@@ -154,7 +252,7 @@ NET_JSON=$(jq -Rsc '
 
 # ---------------------------------------------------------------- load / freq
 read -r LOAD1 LOAD5 LOAD15 _ < /proc/loadavg
-NCPU=$(nproc 2>/dev/null || echo 1)
+NCPU=$(run nproc 2>/dev/null || echo 1)
 
 FREQ_MHZ=$(awk '
   { s += $1; n++ }
@@ -242,7 +340,8 @@ read -r MEM_PCT MEM_USED_GIB MEM_TOTAL_GIB SWAP_PCT SWAP_USED_GIB SWAP_TOTAL_GIB
 
 # ---------------------------------------------------------------- sensors
 SENSORS_JSON="{}"
-have sensors && SENSORS_JSON=$(sensors -j 2>/dev/null || echo '{}')
+have sensors && SENSORS_JSON=$(run sensors -j 2>/dev/null | head -c "$MAX_SENSORS")
+[ -n "$SENSORS_JSON" ] || SENSORS_JSON="{}"
 # Guard against sensors emitting warnings that break JSON.
 jq -e . >/dev/null 2>&1 <<<"$SENSORS_JSON" || SENSORS_JSON="{}"
 
@@ -320,9 +419,9 @@ done
 
 # NVIDIA only in --full mode: nvidia-smi can spin the dGPU up.
 if [ "$FULL" = "1" ] && have nvidia-smi; then
-  nv=$(nvidia-smi --query-gpu=utilization.gpu,temperature.gpu,memory.used,memory.total \
-         --format=csv,noheader,nounits 2>/dev/null | head -1)
-  nv_name=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)
+  nv=$(run nvidia-smi --query-gpu=utilization.gpu,temperature.gpu,memory.used,memory.total \
+         --format=csv,noheader,nounits 2>/dev/null | head -c "$MAX_SMI" | head -1)
+  nv_name=$(run nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -c "$MAX_SMI" | head -1)
   nv_name=$(squish "${nv_name#NVIDIA }")   # "NVIDIA GeForce RTX 3060" -> "GeForce RTX 3060"
   if [ -n "$nv" ]; then
     IFS=', ' read -r nv_util nv_temp nv_mu nv_mt <<<"$nv"
@@ -351,9 +450,9 @@ GPU_JSON=$(jq -Rsc '
 # spaces (a USB stick labelled "My Drive" lands on /run/media/<user>/My Drive),
 # and splitting on whitespace silently attributed its size to the wrong column.
 DISK_JSON=$(
-  df -B1 --output=source,pcent,used,size,target \
+  run df -B1 --output=source,pcent,used,size,target \
      -x tmpfs -x devtmpfs -x efivarfs -x squashfs -x overlay -x ramfs 2>/dev/null \
-  | tail -n +2 \
+  | head -c "$MAX_DF" | tail -n +2 \
   | jq -Rsc '
       [ split("\n")[]
         | select(length > 0)
@@ -444,7 +543,7 @@ UPTIME_STR=$(awk '{ s = int($1)
 TOP_CPU_JSON="[]"
 TOP_MEM_JSON="[]"
 top_procs() {
-  ps -eo "comm,$1" --sort="-$1" --no-headers 2>/dev/null | head -5 | jq -Rsc '
+  run ps -eo "comm,$1" --sort="-$1" --no-headers 2>/dev/null | head -c "$MAX_PS" | head -5 | jq -Rsc '
     split("\n") | map(select(length > 0)
     | capture("^(?<name>.*\\S)[ \t]+(?<pct>[0-9]+(\\.[0-9]+)?)[ \t]*$")
     | { name: .name, pct: (.pct | tonumber) })'
@@ -502,4 +601,4 @@ jq -nc \
     temp_c: $temp_c, temp_label: $temp_label, fans: $fans, gpus: $gpus,
     disks: $disks, storage: $storage, net: $net, battery: $battery, uptime: $uptime,
     top_cpu: $top_cpu, top_mem: $top_mem, full: ($full == 1)
-  }'
+  }' | head -c "$MAX_OUTPUT"

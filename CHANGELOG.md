@@ -4,6 +4,53 @@ All notable changes to this plugin are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] — 2026-09-11
+
+Supply-chain and resource-exhaustion hardening, from a marketplace security
+review of 1.1.0 ([#6263](https://github.com/omacom/omarchy-plugin-marketplace/issues/6263)).
+No change to what the widget shows.
+
+### Security
+
+- **Nothing is resolved through the caller's PATH any more.** The backend used
+  an `env`-style shebang and called `jq`, `sensors`, `df`, `ps`, `nvidia-smi`
+  and `lspci` by bare name, so a binary planted earlier in the shell process's
+  PATH would have been executed every 1.5-3 seconds inside `omarchy-shell`.
+  The interpreter is now `/bin/bash` by absolute path, the script resets PATH
+  to root-owned system directories before any helper runs, and the widget
+  launches it through `/usr/bin/env -i` with an empty environment — which also
+  drops `BASH_ENV`, `LD_PRELOAD` and anything else inherited from the session.
+- **The state file is validated before it is read.** It was read through the
+  QML file API, which cannot ask what a path actually is, so a symlink left at
+  `~/.local/state/omarchy-hwmon/expanded` would have been followed. Both
+  directions now go through `hwmon.sh state-read` / `state-write`, which refuse
+  symlinks, require a regular file owned by the user, cap it at two bytes, and
+  refuse a state directory that is not a private directory the user owns.
+  Writes replace the target and rename into place.
+
+### Fixed
+
+- **Unbounded buffering of helper output.** `sensors -j` and `nvidia-smi` were
+  captured whole into shell variables, and the widget's `StdioCollector`
+  buffers a sample's entire stdout with no limit of its own. Each producer now
+  has a byte cap applied where it is produced (256 KiB for `sensors`, 4 KiB for
+  `nvidia-smi`, and caps on `lspci`, `df`, `ps` and the script's own output).
+- **A sample that ignored SIGTERM was never killed.** The watchdog only set
+  `running = false`, which is a request; Quickshell's `Process` has no signal
+  method, so a helper stuck in a driver call sat there holding memory. Samples
+  now run under `setsid` in their own process group, every external helper runs
+  under `timeout -s KILL`, and a sample that is still alive 3 s after the
+  terminate request has its whole process group killed — verified against a
+  backend that traps SIGTERM, including a child process it spawned.
+
+### Changed
+
+- The expand/collapse choice no longer live-syncs between bars on separate
+  monitors; it is read once at startup. Validating the file matters more than
+  the sync did.
+- New runtime dependency: `util-linux` (for `setsid`), part of the Arch `base`
+  group and already present on any Omarchy install.
+
 ## [1.1.0] — 2026-09-11
 
 Hardening and correctness pass before marketplace submission. No change to what
@@ -94,5 +141,6 @@ First packaged release as an Omarchy plugin.
   from each card's PCI address rather than hard-coded.
 - Plugin id `io.github.grootaiinfinity.hwmon`.
 
+[1.2.0]: https://github.com/GrootAiInfinity/omarchy-hwmon/releases/tag/v1.2.0
 [1.1.0]: https://github.com/GrootAiInfinity/omarchy-hwmon/releases/tag/v1.1.0
 [1.0.0]: https://github.com/GrootAiInfinity/omarchy-hwmon/releases/tag/v1.0.0

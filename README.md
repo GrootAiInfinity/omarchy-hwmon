@@ -46,7 +46,8 @@ about the plugin. The full list of what the panel shows is below.
 - Omarchy (Quattro) with the Quickshell-based bar
 - `jq` — the backend builds its JSON with it
 - `lm_sensors` (`sensors`) — temperatures and fan speeds
-- coreutils / procps (`df`, `ps`, `nproc`, `uname`), which Omarchy already has
+- coreutils / procps / util-linux (`df`, `ps`, `nproc`, `uname`, `timeout`,
+  `setsid`), all already present on any Omarchy install
 
 Optional, each only enabling its own row:
 
@@ -136,7 +137,16 @@ The plugin is read-only with respect to your system.
 - **Values that come from outside** — process names, mount points, device and
   GPU model strings — are encoded as JSON by `jq` and rendered as
   `Text.PlainText`, so they cannot break the output or promote themselves to
-  markup in the panel.
+  markup in the panel. Each producer also has a byte cap, so no helper can grow
+  the shell's memory without bound.
+- **Nothing is resolved through your PATH.** The backend is launched by
+  absolute path with an empty environment, and resets `PATH` to root-owned
+  system directories before calling any helper, so a binary planted earlier in
+  your `PATH` cannot stand in for `jq`, `sensors` or `nvidia-smi`.
+- **The state file is checked before it is read:** a symlink, a file someone
+  else owns, or anything larger than two bytes is ignored rather than loaded.
+- Each sample runs in its own process group under a time limit, and one that
+  ignores the shutdown request has its whole process group killed.
 
 ## Troubleshooting
 

@@ -26,19 +26,23 @@ Panel {
   }
   readonly property string script: pluginDir + "/hwmon.sh"
 
-  // Where the runtime expand/collapse choice is remembered. This is the only
-  // file the plugin writes; it never touches shell.json or any other config the
-  // user owns. Empty when the environment gives us nowhere to put it, in which
-  // case the toggle simply does not persist.
-  readonly property string stateDir: {
-    var base = Quickshell.env("XDG_STATE_HOME") || ""
-    if (!base) {
-      var home = Quickshell.env("HOME") || ""
-      base = home ? home + "/.local/state" : ""
-    }
-    return base ? base.replace(/\/$/, "") + "/omarchy-hwmon" : ""
+  // Every helper is launched through an absolute interpreter with an empty
+  // environment and a PATH of root-owned system directories only. Nothing is
+  // resolved through the shell process's own PATH, so a binary planted ahead of
+  // /usr/bin in it cannot stand in for the backend or anything the backend
+  // calls; BASH_ENV, LD_PRELOAD and friends are dropped with the rest of the
+  // environment. setsid puts the sample in its own process group so a stuck
+  // one can be killed whole without touching the shell's group.
+  function launch(argv) {
+    var pre = ["/usr/bin/setsid", "/usr/bin/env", "-i",
+               "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+               "LC_ALL=C"]
+    var home = Quickshell.env("HOME") || ""
+    if (home) pre.push("HOME=" + home)
+    var xdg = Quickshell.env("XDG_STATE_HOME") || ""
+    if (xdg) pre.push("XDG_STATE_HOME=" + xdg)
+    return pre.concat(argv)
   }
-  readonly property string statePath: stateDir ? stateDir + "/expanded" : ""
 
   property var stats: ({})
   property bool expanded: false
@@ -66,6 +70,7 @@ Panel {
   // here, and all of them mean the numbers on screen are no longer current.
   property double lastSampleMs: 0
   property bool stalled: false
+  property int killPid: 0
   readonly property bool degraded: statsError !== "" || stalled
   readonly property int staleAfterMs: 12000
 
@@ -129,9 +134,9 @@ Panel {
     // (a hung nvidia-smi, an unresponsive sensor) releases the slot instead of
     // freezing the readout for the rest of the session.
     if (statsProc.running) return
-    statsProc.command = root.opened
+    statsProc.command = root.launch(root.opened
       ? [root.script, "stats", "--full"]
-      : [root.script, "stats"]
+      : [root.script, "stats"])
     statsProc.running = true
     sampleWatchdog.restart()
   }
@@ -149,16 +154,24 @@ Panel {
     }
   }
 
-  // Persisting the toggle goes through FileView, so the path is handed to the
-  // file API as data. It is never spliced into a shell command line, where a
-  // quote in $XDG_STATE_HOME or $HOME would end the quoting and turn the rest
-  // of the value into commands run by the shell.
+  // Reading and writing the saved toggle is the backend's job. The QML file API
+  // cannot ask whether a path is a regular file, who owns it or how big it is,
+  // so a symlink left at the state path would have been followed and its
+  // contents read into the shell process. hwmon.sh checks all of that, and
+  // writes through a private directory it owns.
+  property var pendingState: null
+
   function setExpanded(v) {
     if (root.expanded === v) return
     root.expanded = v
     root.stateResolved = true
-    if (root.statePath === "") return
-    stateFile.setText(v ? "1" : "0")
+    if (stateWriteProc.running) { root.pendingState = v; return }
+    root.writeState(v)
+  }
+
+  function writeState(v) {
+    stateWriteProc.command = root.launch([root.script, "state-write", v ? "1" : "0"])
+    stateWriteProc.running = true
   }
 
   function applyState(raw) {
@@ -168,8 +181,9 @@ Panel {
       root.stateResolved = true
       return
     }
-    // Nothing saved yet: fall back to the manifest setting, which the shell
-    // injects a tick after onCompleted - hence the deferred read.
+    // Nothing saved yet, or the backend refused the state file as unsafe: fall
+    // back to the manifest setting, which the shell injects a tick after
+    // onCompleted - hence the deferred read.
     Qt.callLater(function () {
       if (!root.stateResolved) {
         root.expanded = root.setting("expanded", false)
@@ -195,6 +209,8 @@ Panel {
 
   Component.onCompleted: {
     lastSampleMs = Date.now()
+    stateReadProc.command = root.launch([root.script, "state-read"])
+    stateReadProc.running = true
     refresh()
   }
 
@@ -218,42 +234,62 @@ Panel {
     onTriggered: {
       // Free the slot so the next tick can sample again; the poll timer above
       // decides when that counts as stale.
-      if (statsProc.running) statsProc.running = false
+      if (!statsProc.running) return
+      root.killPid = Number(statsProc.processId) || 0
+      statsProc.running = false        // asks politely (SIGTERM)
+      hardKillTimer.restart()          // and follows up if it is ignored
     }
   }
 
   Process {
     id: statsProc
-    onExited: sampleWatchdog.stop()
+    onExited: { sampleWatchdog.stop(); hardKillTimer.stop(); root.killPid = 0 }
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: root.parseStats(text)
     }
   }
 
-  FileView {
-    id: stateFile
-    path: root.statePath
-    watchChanges: true            // a second bar on another monitor stays in sync
-    atomicWrites: true
-    printErrors: false
-    onLoaded: root.applyState(text())
-    onLoadFailed: root.applyState("")
-    onFileChanged: reload()
-    // First run: ~/.local/state/omarchy-hwmon does not exist yet and FileView
-    // will not create it. Make it once, then retry the save.
-    onSaveFailed: {
-      if (root.statePath === "" || mkStateDirProc.running || stateFile.dirRetried) return
-      stateFile.dirRetried = true
-      mkStateDirProc.command = ["mkdir", "-p", "--", root.stateDir]
-      mkStateDirProc.running = true
+  // SIGTERM is a request. A process blocked in an uninterruptible driver call -
+  // the reason a hardware sample hangs in the first place - can sit through it,
+  // so escalate rather than leave it holding memory and a process slot.
+  Timer {
+    id: hardKillTimer
+    interval: 3000
+    repeat: false
+    onTriggered: {
+      if (!statsProc.running || !root.killPid) return
+      // Kill the whole process group, so a stuck nvidia-smi under the script
+      // goes too - but only once ps confirms the pid really is that group's
+      // leader. setsid makes it one; if that ever failed, a group kill would
+      // hit the shell's own group, so fall back to the single pid instead.
+      killProc.command = root.launch(["/bin/sh", "-c",
+        'pgid=$(/usr/bin/ps -o pgid= -p "$1" 2>/dev/null | tr -d " ")\n' +
+        'if [ -n "$pgid" ] && [ "$pgid" = "$1" ]; then kill -9 -- "-$pgid"; else kill -9 -- "$1"; fi',
+        "sh", String(root.killPid)])
+      killProc.running = true
     }
-    property bool dirRetried: false
+  }
+
+  Process { id: killProc }
+
+  Process {
+    id: stateReadProc
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.applyState(text)
+    }
   }
 
   Process {
-    id: mkStateDirProc
-    onExited: if (root.statePath !== "") stateFile.setText(root.expanded ? "1" : "0")
+    id: stateWriteProc
+    onExited: {
+      if (root.pendingState === null) return
+      var v = root.pendingState
+      root.pendingState = null
+      if (v !== root.expanded) return
+      root.writeState(v)
+    }
   }
 
   // ================================================================ bar button
