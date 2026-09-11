@@ -4,6 +4,38 @@ All notable changes to this plugin are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.1] — 2026-09-11
+
+Closes a time-of-check/time-of-use race in the state file, from the follow-up
+marketplace security review of 1.2.0
+([#6263](https://github.com/omacom/omarchy-plugin-marketplace/issues/6263)).
+No change to what the widget shows.
+
+### Security
+
+- **The state file is validated on the descriptor, not on the path.** 1.2.0
+  asked whether the path was a symlink, a regular file, ours, and small enough,
+  and then opened that path again — so an entry exchanged for a symlink in
+  between was checked as one object and read as another, past both the identity
+  check and the two-byte cap. `state-read` now lstats the name, opens it, and
+  fstats the descriptor through `/dev/fd`: unless the device and inode still
+  match, the read is refused, and type, owner and size are settled against the
+  descriptor itself. Against an attacker swapping the path in a loop, 1.2.0
+  returned the planted file's contents in 51 of 600 reads; this returns it in
+  none.
+- **The read cannot hang.** It runs in a child under a two-second limit,
+  because opening the path is the one step that blocks — a FIFO left there
+  waits for a writer that never comes, and would have held the widget's single
+  in-flight sample slot indefinitely.
+- **The temporary file is created exclusively and never reopened by name.**
+  1.2.0 removed a predictable `.expanded.$$` and then opened that name with
+  shell redirection, which a concurrent replacement could redirect. The name is
+  now 64 bits of `/dev/urandom`, and one `O_CREAT|O_EXCL|O_NOFOLLOW` open
+  writes and fsyncs the value through that same descriptor. The directory is
+  re-checked immediately before `rename(2)` — which replaces the destination
+  without following it, so the old "remove the target first" step, itself a
+  check-then-open race, is gone — and the directory is fsynced afterwards.
+
 ## [1.2.0] — 2026-09-11
 
 Supply-chain and resource-exhaustion hardening, from a marketplace security
@@ -141,6 +173,7 @@ First packaged release as an Omarchy plugin.
   from each card's PCI address rather than hard-coded.
 - Plugin id `io.github.grootaiinfinity.hwmon`.
 
+[1.2.1]: https://github.com/GrootAiInfinity/omarchy-hwmon/releases/tag/v1.2.1
 [1.2.0]: https://github.com/GrootAiInfinity/omarchy-hwmon/releases/tag/v1.2.0
 [1.1.0]: https://github.com/GrootAiInfinity/omarchy-hwmon/releases/tag/v1.1.0
 [1.0.0]: https://github.com/GrootAiInfinity/omarchy-hwmon/releases/tag/v1.0.0

@@ -49,6 +49,7 @@ MAX_DF=65536              # one line per mount
 MAX_PS=16384              # five lines, twice
 MAX_OUTPUT=1048576        # this script's own stdout
 CMD_TIMEOUT=5             # per external helper; the widget also has a deadline
+STATE_TIMEOUT=2           # the state-file open, which is all that can block
 
 # Run an external helper under a time limit. A sensor that never answers - a
 # wedged i2c bus, a dGPU that will not wake - stops the sample instead of
@@ -77,6 +78,13 @@ EOF
 # regular file, who owns it, or how big it is - so a symlink left at that path
 # would have been followed and its contents handed to the shell process. Both
 # directions now go through here, where those questions can be answered.
+#
+# Answering them about a *pathname* is not enough. Between the check and the
+# open, the entry can be exchanged for a symlink: the checks then describe one
+# object and the open returns another, which is how a two-byte limit turns into
+# an unbounded read of someone else's file. So nothing below trusts a name.
+# The read validates the descriptor it actually opened, and the write creates
+# its temporary file with O_EXCL|O_NOFOLLOW and never reopens it by name.
 
 state_path() {
   local base=${XDG_STATE_HOME:-}
@@ -97,37 +105,78 @@ dir_is_safe() {
   return 0
 }
 
+# Bash cannot ask a redirection for O_NOFOLLOW, so identity is settled around
+# the open instead: lstat the name, open it, fstat the descriptor through
+# /dev/fd, and require the same device and inode. A symlink resolves to a
+# different inode than the link itself, and a file swapped in at any point
+# either side of the open has a different inode too, so both are rejected -
+# and every remaining question (type, owner, size) is asked of the descriptor,
+# never of the name.
+#
+# This runs in a child under `timeout` because the open is the one step that
+# can block: a FIFO left at the path waits for a writer that never comes, and
+# a read stuck here would hold the widget's single in-flight slot for good.
+STATE_READ_CHILD='
+  set -u
+  f=$1
+  pre=$(stat -c "%d:%i|%F" -- "$f" 2>/dev/null) || exit 0   # lstat: no follow
+  case ${pre#*|} in
+    "regular file"|"regular empty file") ;;
+    *) exit 0 ;;                                # symlink, FIFO, device, dir
+  esac
+  exec 9<"$f" 2>/dev/null || exit 0
+  post=$(stat -L -c "%d:%i|%F|%u|%s" /dev/fd/9 2>/dev/null) || exit 0
+  ident=${post%%|*}; rest=${post#*|}
+  ftype=${rest%%|*}; rest=${rest#*|}
+  fuid=${rest%%|*}; fsize=${rest##*|}
+  [ "$ident" = "${pre%%|*}" ] || exit 0         # not the object we inspected
+  case $ftype in "regular file"|"regular empty file") ;; *) exit 0 ;; esac
+  [ "$fuid" = "$EUID" ] || exit 0               # and only our own
+  [ "$fsize" -le 2 ] 2>/dev/null || exit 0      # one byte plus a newline
+  # `read` reports failure at EOF when the last line has no newline, which is
+  # how state-write leaves it: check the value, not the exit status.
+  IFS= read -r v <&9 2>/dev/null
+  case ${v:-} in 0|1) printf "%s" "$v" ;; esac
+'
+
 state_read() {
-  local f d v size
+  local f d v
   f=$(state_path) || return 0
   d=${f%/*}
   dir_is_safe "$d" || return 0
-  [ -L "$f" ] && return 0                       # never follow a planted link
-  [ -f "$f" ] || return 0                       # regular files only
-  [ -O "$f" ] || return 0                       # and only our own
-  size=$(stat -c %s -- "$f" 2>/dev/null) || return 0
-  [ "$size" -le 2 ] 2>/dev/null || return 0     # one byte plus a newline
-  # `read` reports failure at EOF when the last line has no newline, which is
-  # exactly how state-write leaves it - so check the value, not read's status.
-  IFS= read -r v <"$f" 2>/dev/null
+  v=$(timeout -s KILL "$STATE_TIMEOUT" /bin/bash -c "$STATE_READ_CHILD" \
+        hwmon-state-read "$f" 2>/dev/null) || return 0
   case "$v" in 0|1) printf '%s' "$v" ;; esac
 }
 
+# One open creates the temporary file with O_CREAT|O_EXCL|O_NOFOLLOW, and the
+# value is written and fsynced through that same descriptor before it closes.
+# Nothing reopens the name in between, the name itself is unguessable, and
+# O_EXCL refuses the path outright if something is sitting there anyway.
+# rename(2) then replaces the destination - symlink or not - without following
+# it, which is also why the old "remove it first" step is gone: that was a
+# check-then-open race of its own, and the rename never needed it.
 state_write() {
-  local v=$1 f d tmp
+  local v=$1 f d tmp rand
   case "$v" in 0|1) ;; *) printf 'hwmon.sh: state-write takes 0 or 1\n' >&2; exit 2 ;; esac
   f=$(state_path) || exit 1
   d=${f%/*}
   [ -L "$d" ] && { printf 'hwmon.sh: state directory is a symlink, refusing\n' >&2; exit 1; }
   [ -d "$d" ] || mkdir -m 700 -p -- "$d" 2>/dev/null
   dir_is_safe "$d" || { printf 'hwmon.sh: state directory is not a private directory we own\n' >&2; exit 1; }
-  # Drop whatever is sitting there first, so a symlink planted at the path
-  # cannot redirect the write, then move the new file into place atomically.
-  [ -e "$f" ] || [ -L "$f" ] && rm -f -- "$f"
-  tmp=$d/.expanded.$$
-  rm -f -- "$tmp"
-  ( umask 077; printf '%s' "$v" >"$tmp" ) || exit 1
+
+  rand=$(od -An -N8 -tx1 /dev/urandom 2>/dev/null | tr -dc 'a-f0-9')
+  [ ${#rand} -eq 16 ] || { printf 'hwmon.sh: no randomness for a temporary name\n' >&2; exit 1; }
+  tmp=$d/.expanded.$rand
+
+  printf '%s' "$v" | run dd of="$tmp" oflag=nofollow conv=excl,fsync status=none 2>/dev/null
+  [ "${PIPESTATUS[1]}" = 0 ] || { rm -f -- "$tmp"; exit 1; }
+
+  # The directory is the only thing left that the rename could be redirected
+  # through, so confirm it is still ours and still private before committing.
+  dir_is_safe "$d" || { rm -f -- "$tmp"; exit 1; }
   mv -f -- "$tmp" "$f" || { rm -f -- "$tmp"; exit 1; }
+  sync -- "$d" 2>/dev/null || :                 # the rename itself, durably
 }
 
 FULL=0

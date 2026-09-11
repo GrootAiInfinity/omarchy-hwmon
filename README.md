@@ -131,7 +131,8 @@ The plugin is read-only with respect to your system.
   `class/net/*/statistics`, `class/drm/card*/device`, `class/power_supply/BAT*`,
   `block/*`, `devices/system/cpu/*/cpufreq`, `devices/virtual/dmi/id`.
 - **Runs:** `jq`, `sensors`, `df`, `ps`, `nproc`, `uname`, `awk`/`sed`/`grep`,
-  and — only while the panel is open — `nvidia-smi` and `lspci`.
+  the coreutils it uses for the state file (`stat`, `dd`, `od`, `sync`, `mv`)
+  and `timeout`, and — only while the panel is open — `nvidia-smi` and `lspci`.
 - **Writes:** one file, `~/.local/state/omarchy-hwmon/expanded`, containing `0`
   or `1`. It never edits `shell.json` or any other file you own.
 - **Values that come from outside** — process names, mount points, device and
@@ -143,8 +144,12 @@ The plugin is read-only with respect to your system.
   absolute path with an empty environment, and resets `PATH` to root-owned
   system directories before calling any helper, so a binary planted earlier in
   your `PATH` cannot stand in for `jq`, `sensors` or `nvidia-smi`.
-- **The state file is checked before it is read:** a symlink, a file someone
-  else owns, or anything larger than two bytes is ignored rather than loaded.
+- **The state file is judged by what was opened, not by its name.** A symlink,
+  a FIFO, a file someone else owns, or anything larger than two bytes is
+  ignored rather than loaded — and because a path can be swapped for a symlink
+  in the moment between a check and an open, those questions are asked of the
+  open file descriptor itself. The write side creates its temporary file
+  exclusively, without following symlinks, and renames it into place.
 - Each sample runs in its own process group under a time limit, and one that
   ignores the shutdown request has its whole process group killed.
 
