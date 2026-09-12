@@ -15,6 +15,17 @@ is "it has the keys the widget reads" \
 is "light samples skip panel-only work" \
    "$(jq -r '[(.storage|length),(.top_cpu|length),(.fans|length)]|add' <<<"$out")" 0
 
+# The per-core grid is drawn straight from this array, so its length is the
+# thread count and nothing else. A snapshot of /proc/stat ends with a newline,
+# and the empty field that awk's split() returns for it once added a
+# seventeenth core to a sixteen-thread machine, reading 0% forever.
+threads=$(grep -c '^cpu[0-9]' /proc/stat)
+is "one entry per thread, no more"   "$(jq -r '.cpu_cores|length' <<<"$out")" "$threads"
+is "and it agrees with ncpu"         "$(jq -r .ncpu <<<"$out")" "$threads"
+is "and with the reported topology"  "$(jq -r .cpu_topology.threads <<<"$out")" "$threads"
+is "every core reads as a percentage" \
+   "$(jq -r '.cpu_cores|map(type=="number" and . >= 0 and . <= 100)|all' <<<"$out")" true
+
 full=$("$HWMON" stats --full)
 is "--full is valid JSON"         "$(jq -e . >/dev/null 2>&1 <<<"$full"; echo $?)" 0
 is "--full says so"               "$(jq -r .full <<<"$full")" true

@@ -4,6 +4,26 @@ All notable changes to this plugin are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.1] — 2026-09-12
+
+Fixes a miscount introduced in 1.3.0: the per-core grid showed one core too many.
+
+### Fixed
+
+- **The CPU core grid drew a seventeenth core on a sixteen-thread machine**, and
+  it read 0% forever. 1.3.0 replaced the `grep` over `/proc/stat` with a
+  `mapfile` read, which kept the trailing newline that command substitution used
+  to strip; the empty field `split()` then returns was treated as another cpu
+  line and appended an extra core. The parser now ignores any line that does not
+  name a cpu, so it no longer depends on how the snapshot happens to end.
+  `ncpu` and `cpu_topology.threads` were always correct — only the grid was
+  wrong.
+
+  `tests/test-backend.sh` now checks that the array holds exactly one entry per
+  thread, agrees with `ncpu` and with the reported topology, and that every entry
+  reads as a percentage. Verified against the previous build, where the new check
+  fails with 17 against 16.
+
 ## [1.4.0] — 2026-09-12
 
 Removes the plugin's own state file. The readout preference is now kept by the

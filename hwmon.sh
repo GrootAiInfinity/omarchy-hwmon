@@ -318,13 +318,19 @@ dt=$(awk -v a="$t1" -v b="$t2" 'BEGIN { d = b - a; if (d <= 0) d = 0.35; print d
 read -r CPU_PCT CPU_CORES_JSON < <(
   awk -v s1="$cpu_snap1" -v s2="$cpu_snap2" '
     BEGIN {
+      # Only lines that actually name a cpu count. A snapshot ends with a
+      # newline, so the last field split() hands back is empty - and an empty
+      # key used to fall through to the per-core branch below and add a
+      # seventeenth core to a sixteen-thread machine, reading 0% forever.
       n1 = split(s1, L1, "\n")
       for (i = 1; i <= n1; i++) { split(L1[i], f, " "); key = f[1]
+        if (key !~ /^cpu[0-9]*$/) continue
         tot = 0; for (j = 2; j <= 9; j++) tot += f[j]
         T1[key] = tot; I1[key] = f[5] + f[6] }
       n2 = split(s2, L2, "\n")
       overall = 0; cores = "["
       for (i = 1; i <= n2; i++) { split(L2[i], f, " "); key = f[1]
+        if (key !~ /^cpu[0-9]*$/) continue
         tot = 0; for (j = 2; j <= 9; j++) tot += f[j]
         dtot = tot - T1[key]; didle = (f[5] + f[6]) - I1[key]
         u = (dtot > 0) ? (100 * (dtot - didle) / dtot) : 0
