@@ -26,10 +26,12 @@ about the plugin. The full list of what the panel shows is below.
     distro, kernel, architecture
   - CPU usage, current / max frequency, load average, and a per-core bar grid
   - Memory and swap
-  - Thermals and fan speeds
+  - Thermals and fan speeds (a stopped fan included, with its PWM duty cycle
+    where the chip exposes one)
   - Per-GPU utilisation meters, each labelled with its model name (e.g.
-    `Radeon RX 6600`, `GeForce RTX 3060`) — AMD/Intel via the
-    `gpu_busy_percent` DRM counter, NVIDIA via `nvidia-smi`
+    `Radeon RX 6600`, `GeForce RTX 3060`, `Arc B390`) — AMD via the
+    `gpu_busy_percent` DRM counter, Intel's `xe`/`i915` via the DRM clients'
+    `/proc/<pid>/fdinfo` cycle counters, NVIDIA via `nvidia-smi`
   - Storage devices: model name, bus (NVMe / SATA / USB), capacity, temperature
   - Disk usage per mount (with the backing device)
   - Live network throughput per interface
@@ -126,12 +128,13 @@ The plugin is read-only with respect to your system.
   It installs no service, no unit, no policy file and no dispatcher hook.
 - **Network:** none. The plugin makes no outbound request of any kind.
 - **Reads:** `/proc/stat`, `/proc/meminfo`, `/proc/loadavg`, `/proc/cpuinfo`,
-  `/proc/uptime`, `/etc/os-release` (parsed, never sourced), and under `/sys`:
+  `/proc/uptime`, DRM clients' `/proc/<pid>/fdinfo/*` (Intel GPU busyness),
+  `/etc/os-release` (parsed, never sourced), and under `/sys`:
   `class/hwmon/*` (temperatures and fans), `class/net/*/statistics`,
   `class/drm/card*/device`, `class/power_supply/BAT*`, `block/*`,
   `devices/system/cpu/*/cpufreq`, `devices/virtual/dmi/id`.
-- **Runs:** `jq`, `df`, `ps`, `uname`, `awk`, `timeout` and `setsid`, and —
-  only while the panel is open — `nvidia-smi` and `lspci`.
+- **Runs:** `jq`, `df`, `ps`, `uname`, `awk`, `grep`, `timeout` and `setsid`,
+  and — only while the panel is open — `nvidia-smi` and `lspci`.
 - **Writes:** nothing. The one preference it remembers is stored by the shell in
   this widget's own entry in `shell.json`, through the API Omarchy gives a
   plugin for exactly that; the shell only lets a plugin write the entry it owns.
@@ -169,9 +172,10 @@ sensor on the machine is shown instead and labelled `SYS`. Loading the driver
 for your platform's sensor chip (`sensors-detect` from `lm_sensors` can identify
 it) gives the kernel more to expose; the plugin then picks it up on its own.
 
-**A GPU shows no utilisation.** It exposes no `gpu_busy_percent` counter and is
-not an NVIDIA card reachable through `nvidia-smi`. Temperature and model name
-may still appear.
+**A GPU shows no utilisation.** It is neither AMD (which exposes
+`gpu_busy_percent`), an Intel `xe`/`i915` card (whose DRM fdinfo cycle counters
+are read), nor an NVIDIA card reachable through `nvidia-smi`. Temperature and
+model name may still appear.
 
 **The widget disappeared after an update.** `omarchy update` / `omarchy refresh
 shell` can rewrite `shell.json` and drop the layout entry — the plugin files
