@@ -276,6 +276,50 @@ gpu_model() {
   printf '%s' "$(squish "$dev")"
 }
 
+# Intel GPUs on the xe/i915 drivers expose no gpu_busy_percent counter (that is
+# AMD's); their engine busyness is recovered from the DRM clients' cycle
+# counters in /proc/<pid>/fdinfo instead. One client can hold several render
+# fds and every one carries the same counters, so a key of (pdev, client-id,
+# engine) is assigned rather than summed - reading a client twice cannot double
+# its cycles.
+#
+# The clients are found once per sample and both snapshots read the same file
+# list, so opening every fdinfo on the machine is paid once rather than twice.
+drm_clients() {
+  grep -lE '^drm-driver:[[:space:]]*(xe|i915)$' /proc/[0-9]*/fdinfo/[0-9]* 2>/dev/null
+}
+
+drm_snapshot() {   # $@ = fdinfo files
+  [ $# -gt 0 ] || return 0
+  awk '
+    /^drm-pdev:/         { pdev = $2 }
+    /^drm-client-id:/    { cid = $2 }
+    /^drm-cycles-/       { e = $1; sub(/^drm-cycles-/, "", e); cyc[pdev SUBSEP cid SUBSEP e] = $2 }
+    /^drm-total-cycles-/ { e = $1; sub(/^drm-total-cycles-/, "", e); tot[pdev SUBSEP cid SUBSEP e] = $2 }
+    END { for (k in cyc) { split(k, a, SUBSEP); print a[1] "\t" a[2] "\t" a[3] "\t" cyc[k] "\t" tot[k] } }
+  ' "$@" 2>/dev/null
+}
+
+# Busiest engine of one card, as a whole percentage, from the two snapshots in
+# $DRM1 / $DRM2: the summed per-client cycle deltas over the window divided by
+# the engine's own tick delta. "null" when neither snapshot held the card.
+drm_busy() {   # $1 = pci address
+  awk -F'\t' -v pdev="$1" '
+    NR == FNR { if ($1 == pdev) { c[$2 SUBSEP $3] = $4; t[$2 SUBSEP $3] = $5 } next }
+    { if ($1 != pdev) next
+      k = $2 SUBSEP $3; if (!(k in c)) next
+      dc = $4 - c[k]; dt = $5 - t[k]
+      if (dt > 0) { busy[$3] += dc; total[$3] = dt } }
+    END { best = -1
+      for (e in busy) if (total[e] > 0) {
+        u = 100 * busy[e] / total[e]; if (u < 0) u = 0
+        if (u > best) best = u
+      }
+      if (best < 0) print "null"
+      else { if (best > 100) best = 100; printf "%.0f", best } }
+  ' <(printf '%s\n' "$DRM1") <(printf '%s\n' "$DRM2")
+}
+
 # ---------------------------------------------------------------- CPU + network
 # Both need a delta across a short window, so take the two snapshots back to
 # back around one sleep.
@@ -309,10 +353,27 @@ for dev in /sys/class/net/*; do
 done
 t1=${EPOCHREALTIME:-$(date +%s.%N)}
 
+# Cards whose utilisation has to come from fdinfo rather than a sysfs counter
+# (Intel's xe/i915) are snapshotted across the same window as the CPU and
+# network deltas, so they cost no extra sleep. DRM_CARDS holds their PCI
+# addresses; DRM1 / DRM2 are the before/after readings.
+DRM_CARDS=()
+for dev in /sys/class/drm/card*/device; do
+  [ -r "$dev/gpu_busy_percent" ] && continue
+  drv=$(basename "$(readlink -f "$dev/driver" 2>/dev/null)" 2>/dev/null)
+  case $drv in xe|i915) ;; *) continue ;; esac
+  DRM_CARDS+=("$(readlink -f "$dev" 2>/dev/null)")
+done
+DRM_FILES=()
+DRM1=; DRM2=
+if [ ${#DRM_CARDS[@]} -gt 0 ]; then mapfile -t DRM_FILES < <(drm_clients); fi
+[ ${#DRM_FILES[@]} -gt 0 ] && DRM1=$(drm_snapshot "${DRM_FILES[@]}")
+
 sleep "$SAMPLE_INTERVAL"
 
 cpu_snap; cpu_snap2=$CPU_SNAP
 t2=${EPOCHREALTIME:-$(date +%s.%N)}
+[ ${#DRM_FILES[@]} -gt 0 ] && DRM2=$(drm_snapshot "${DRM_FILES[@]}")
 dt=$(awk -v a="$t1" -v b="$t2" 'BEGIN { d = b - a; if (d <= 0) d = 0.35; print d }')
 
 read -r CPU_PCT CPU_CORES_JSON < <(
@@ -528,24 +589,49 @@ else
 fi
 CPU_TEMP=$(mdeg "$CPU_TEMP")
 
-# Fan speeds only appear in the detail panel, and on this machine they live on
-# the vendor's WMI chip - the expensive kind to read. Collect them with the rest
-# of the panel-only data.
+# Fan speeds only appear in the detail panel. A stopped fan reads 0 and is kept
+# - on a laptop that idles fanless that row is how you can tell the fan is off
+# rather than absent. Some machines expose one physical fan through two chips (a
+# generic acpi_fan beside the EC's own hwmon) with the same name and rpm; those
+# are listed once, preferring whichever reading carries a pwmN duty cycle. The
+# kernel reports pwm as 0-255, folded into a percentage.
 FAN_JSON="[]"
 if [ "$FULL" = "1" ]; then
+  declare -A fan_rpm=()
+  declare -A fan_pwm=()
+  fan_order=()
   for _h in /sys/class/hwmon/hwmon*; do
     for _f in "$_h"/fan*_input; do
       [ -r "$_f" ] || continue
       IFS= read -r _v < "$_f" 2>/dev/null || continue
-      [[ $_v =~ ^[0-9]+$ ]] && [ "$_v" -gt 0 ] || continue   # a stopped fan is not news
+      [[ $_v =~ ^[0-9]+$ ]] || continue
       temp_label_of "$_f"
       [ -n "$TLABEL" ] || { TLABEL=${_f##*/}; TLABEL=${TLABEL%_input}; }
-      fan_rows+=$(squish "$TLABEL")$'\t'$_v$'\n'
+      _name=$(squish "$TLABEL")
+
+      # fan1_input -> pwm1, which the kernel reports as 0-255.
+      _n=${_f##*fan}; _n=${_n%%_input}
+      _pwm=null
+      if [ -r "${_f%fan*_input}pwm${_n}" ]; then
+        IFS= read -r _raw < "${_f%fan*_input}pwm${_n}" 2>/dev/null || _raw=
+        [[ $_raw =~ ^[0-9]+$ ]] && _pwm=$(( (_raw * 100 + 127) / 255 ))
+      fi
+
+      _key=$_name/$_v
+      if [ -z "${fan_rpm[$_key]+x}" ]; then
+        fan_order+=("$_key"); fan_rpm[$_key]=$_v; fan_pwm[$_key]=$_pwm
+      elif [ "$_pwm" != null ] && [ "${fan_pwm[$_key]}" = null ]; then
+        fan_pwm[$_key]=$_pwm
+      fi
     done
+  done
+  for _key in "${fan_order[@]}"; do
+    fan_rows+="${_key%/*}	${fan_rpm[$_key]}	${fan_pwm[$_key]}"$'\n'
   done
   FAN_JSON=$(jq -Rsc '
     split("\n") | map(select(length > 0) | split("\t")
-    | { name: .[0], rpm: (.[1] | tonumber) })' <<<"$fan_rows" 2>/dev/null)
+    | { name: .[0], rpm: (.[1] | tonumber),
+        pwm: (if .[2] == "null" then null else (.[2] | tonumber) end) })' <<<"$fan_rows" 2>/dev/null)
   [ -n "$FAN_JSON" ] || FAN_JSON="[]"
 fi
 
@@ -554,15 +640,23 @@ fi
 # single jq pass below; `squish` has already removed any tab from the model.
 gpu_rows=""
 
-# AMD (and any other) via the DRM sysfs busy counter.
+# AMD via the DRM sysfs busy counter; Intel's xe/i915 have none and use the
+# fdinfo deltas taken around the sample window instead. The card's temperature
+# and model name are shared by both paths.
 for dev in /sys/class/drm/card*/device; do
-  [ -r "$dev/gpu_busy_percent" ] || continue
+  pci=$(readlink -f "$dev" 2>/dev/null); pci=${pci##*/}             # 0000:06:00.0
   vendor=$(rd "$dev/vendor")
-  busy=$(num "$(rd "$dev/gpu_busy_percent")" 0)
+
+  if [ -r "$dev/gpu_busy_percent" ]; then
+    busy=$(num "$(rd "$dev/gpu_busy_percent")" 0)
+  else
+    drv=$(basename "$(readlink -f "$dev/driver" 2>/dev/null)" 2>/dev/null)
+    case $drv in xe|i915) ;; *) continue ;; esac
+    busy=$(drm_busy "$pci")
+  fi
+
   name="GPU"
   temp_raw=
-
-  pci=$(readlink -f "$dev" 2>/dev/null); pci=${pci##*/}             # 0000:06:00.0
   model=$(gpu_model "$pci")
 
   # The card's own hwmon, which is a directory inside the card's device node -

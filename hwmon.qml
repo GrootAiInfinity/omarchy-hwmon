@@ -586,6 +586,8 @@ Panel {
               Chip {
                 required property var modelData
                 text: String(modelData.name).replace(/_/g, " ") + "  " + modelData.rpm + " rpm"
+                      + (modelData.pwm !== null && modelData.pwm !== undefined
+                         ? "  ·  " + Math.round(modelData.pwm) + "%" : "")
               }
             }
           }
