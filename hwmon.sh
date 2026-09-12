@@ -6,9 +6,6 @@
 #   hwmon.sh stats --full   Everything above plus NVIDIA GPU (nvidia-smi, which
 #                           can wake the dGPU), physical storage devices and the
 #                           top processes by CPU/RAM.
-#   hwmon.sh state-read     Print the saved bar-readout choice (0 or 1), if the
-#                           state file passes its safety checks.
-#   hwmon.sh state-write 0|1  Save that choice.
 #   hwmon.sh reap PID AGE   Tear down a sample that outlived its deadline, after
 #                           re-checking from /proc that PID is still the leader
 #                           of a group of ours at least AGE seconds old.
@@ -20,8 +17,9 @@
 # `num`, so no reading from /proc, /sys, `ps` or `df` can produce broken JSON.
 #
 # The script reads only kernel-provided files and runs only read-only tools. It
-# asks for no elevated privileges, never touches the network, and writes exactly
-# one file: the state file handled by state-write below.
+# asks for no elevated privileges, never touches the network, and writes no
+# files at all: the widget's one saved preference is kept by the shell, in this
+# widget's own entry in shell.json.
 #
 # The interpreter is an absolute path and PATH is replaced with root-owned
 # system directories before any helper runs, so a binary planted earlier in the
@@ -51,7 +49,6 @@ MAX_DF=65536              # one line per mount
 MAX_PS=16384              # five lines, twice
 MAX_OUTPUT=1048576        # this script's own stdout
 CMD_TIMEOUT=5             # per external helper; the widget also has a deadline
-STATE_TIMEOUT=2           # the state-file open, which is all that can block
 
 # Run an external helper under a time limit. A sensor that never answers - a
 # wedged i2c bus, a dGPU that will not wake - stops the sample instead of
@@ -61,8 +58,6 @@ run() { timeout -s KILL "$CMD_TIMEOUT" "$@"; }
 usage() {
   cat <<'EOF'
 Usage: hwmon.sh [stats] [--full]
-       hwmon.sh state-read
-       hwmon.sh state-write 0|1
        hwmon.sh reap PID MIN_AGE_SECONDS
        hwmon.sh --help
 
@@ -70,244 +65,9 @@ Usage: hwmon.sh [stats] [--full]
   --full       Also collect NVIDIA GPU stats, storage devices and top processes.
                Costs more and can wake a sleeping discrete GPU, so the widget
                only asks for it while its panel is open.
-  state-read   Print the saved bar-readout choice, or nothing.
-  state-write  Save it.
   reap         Tear down a wedged sample's process group, identity re-checked
                from /proc first. The widget's watchdog is what asks for this.
 EOF
-}
-
-# ------------------------------------------------------------------ state file
-# The expand/collapse choice is the only thing this plugin writes. It lives
-# under $XDG_STATE_HOME (or $HOME/.local/state), inside directories that any
-# process running as this user can rearrange while we are working in them, so
-# nothing below trusts a *pathname*.
-#
-# Two rounds of review each removed a different way for a name to stop
-# describing the object it named. The first was in the final entry: validate
-# the path, then open the path, and a symlink swapped in between turned a
-# two-byte read into an unbounded one. The second is in the directories above
-# it: validating a directory and then reaching back through it by name for
-# every later step re-resolves the whole path each time, so a directory
-# exchanged after the check silently receives the create, the rename, or the
-# read.
-#
-# What closes both is holding a descriptor and never letting go. The state
-# directory is opened one component at a time starting at the filesystem root:
-# each component is lstat'd by name, opened, then fstat'd through its
-# descriptor, and the device/inode pair must match across the open - so a
-# component exchanged for a symlink, or for another directory, is rejected
-# rather than followed. Ownership, type and permissions are then asked of that
-# descriptor, never of the name.
-#
-# The descriptor that survives the walk *is* the directory, not a route to it.
-# "/proc/self/fd/9/expanded" is openat(9, "expanded"): the kernel jumps to the
-# directory the descriptor pins and resolves one name inside it, with no path
-# above it to re-traverse. That is how the create, the read, the rename, the
-# unlink and the fsync below all land in the object the walk validated, whatever
-# happens to the path in the meantime - bash has no openat/renameat/unlinkat of
-# its own, and this is the equivalent the kernel provides. Every step is a plain
-# operation on that one name, so there is no second component left to race.
-
-PROCFD=/proc/self/fd
-STATE_DIR=$PROCFD/9       # the validated state directory, named by descriptor
-STATE_NAME=expanded       # the one entry in it
-STATE_OP_TIMEOUT=8        # whole-operation ceiling, see the dispatcher below
-
-state_dir_path() {
-  local base=${XDG_STATE_HOME:-}
-  [ -n "$base" ] || base=${HOME:-}/.local/state
-  [ -n "${XDG_STATE_HOME:-}${HOME:-}" ] || return 1   # nowhere to persist
-  case $base in /*) ;; *) return 1 ;; esac             # must be absolute
-  printf '%s/omarchy-hwmon' "${base%/}"
-}
-
-# Ownership and permissions for one directory on the walk, asked of the
-# descriptor. The final directory has to be ours and closed to everyone else.
-# The ones above it have to be ours or root's, and may be writable by others
-# only when they are sticky - /tmp is the one legitimate case of that, and the
-# sticky bit is exactly what stops another user from swapping our entry out of
-# it.
-dir_policy_ok() {
-  local uid=$1 mode=$2 final=$3 perm special grp oth
-  perm=${mode: -3}; special=${mode%"$perm"}
-  grp=${perm:1:1}; oth=${perm:2:1}
-  if [ "$final" = 1 ]; then
-    [ "$uid" = "$EUID" ] || return 1
-    case $grp$oth in *[2367]*) return 1 ;; esac
-  else
-    [ "$uid" = "$EUID" ] || [ "$uid" = 0 ] || return 1
-    case $grp$oth in
-      *[2367]*) case $special in *[1357]) ;; *) return 1 ;; esac ;;
-    esac
-  fi
-  return 0
-}
-
-# Descend one component, leaving it open on fd 9 (fd 8 is the scratch the new
-# descriptor arrives on). The lstat is resolved from fd 9 too, so even the name
-# being inspected is looked up inside the directory we already hold.
-state_step() {
-  local comp=$1 final=$2 pre post ident ftype uid mode
-  pre=$(stat -c '%d:%i|%F' -- "$STATE_DIR/$comp" 2>/dev/null) || return 1
-  [ "${pre#*|}" = directory ] || return 1        # symlink, file, FIFO, device
-  exec 8<"$STATE_DIR/$comp" 2>/dev/null || return 1
-  post=$(stat -L -c '%d:%i|%F|%u|%a' "$PROCFD/8" 2>/dev/null) || { exec 8<&-; return 1; }
-  ident=${post%%|*}; post=${post#*|}
-  ftype=${post%%|*}; post=${post#*|}
-  uid=${post%%|*}; mode=${post##*|}
-  if [ "$ident" != "${pre%%|*}" ] ||                 # swapped across the open
-     [ "$ftype" != directory ] ||
-     ! dir_policy_ok "$uid" "$mode" "$final"; then
-    exec 8<&-
-    return 1
-  fi
-  exec 9<&8
-  exec 8<&-
-}
-
-state_close_dir() { exec 9<&- 2>/dev/null; return 0; }
-
-# Walk to the state directory and leave it on fd 9. With $1 = 1 (writes only)
-# a missing component is created as we go - inside the directory we are
-# holding, never at a path resolved again from the top.
-state_open_dir() {
-  local create=${1:-0} path comp rest final
-  path=$(state_dir_path) || return 1
-  [ -d /proc/self/fd ] || return 1        # no /proc: refuse rather than guess
-  exec 9</ 2>/dev/null || return 1        # the anchor: / is root's, or nothing is
-  rest=${path#/}
-  while [ -n "$rest" ]; do
-    case $rest in
-      */*) comp=${rest%%/*}; rest=${rest#*/}; final=0 ;;
-      *)   comp=$rest;       rest="";         final=1 ;;
-    esac
-    case $comp in
-      '') continue ;;                     # a doubled slash names nothing
-      .|..) state_close_dir; return 1 ;;  # not validatable component by component
-    esac
-    # `mkdir -p` used to create the whole chain; with the walk it is created
-    # the same way it is validated, one component at a time inside the
-    # directory we are holding. A failure is ignored here - whatever is at the
-    # name still has to pass the step below.
-    if [ "$create" = 1 ] && [ ! -e "$STATE_DIR/$comp" ]; then
-      mkdir -m 700 -- "$STATE_DIR/$comp" 2>/dev/null || :
-    fi
-    state_step "$comp" "$final" || { state_close_dir; return 1; }
-  done
-  return 0
-}
-
-# Read the value through the retained directory descriptor.
-#
-# Identity is settled around the open here as well: lstat the name inside fd 9,
-# open it, fstat that descriptor, and require the same device and inode. A
-# symlink resolves to a different inode than the link itself, so no-follow falls
-# out of the same comparison, and type, owner and size are all asked of the
-# descriptor.
-#
-# This runs in a child under `timeout` because the open is the one step that can
-# block: a FIFO left at the name waits for a writer that never comes, and a read
-# stuck there would hold the widget's single in-flight sampling slot for good.
-# The child inherits fd 9, and /proc/self/fd/9 in the child is that same
-# directory.
-STATE_READ_CHILD='
-  set -u
-  d=$1; name=$2
-  # The widget replaces this file by rename whenever the toggle changes, so a
-  # changed inode is far more often our own write than an attacker - a read
-  # racing one was refused about 3% of the time, and at startup that silently
-  # drops the saved toggle in favour of the manifest default. Retry instead.
-  # Each attempt is validated on its own descriptor from scratch, so an object
-  # swapped in is still never read: retrying lets a legitimate read finish, and
-  # the worst an attacker can do by swapping forever is deny the read.
-  n=0
-  while [ $n -lt 5 ]; do
-    n=$((n + 1))
-    pre=$(stat -c "%d:%i|%F" -- "$d/$name" 2>/dev/null) || exit 0   # lstat: no follow
-    case ${pre#*|} in
-      "regular file"|"regular empty file") ;;
-      *) exit 0 ;;                              # symlink, FIFO, device, dir
-    esac
-    exec 7<"$d/$name" 2>/dev/null || exit 0
-    post=$(stat -L -c "%d:%i|%F|%u|%s" /proc/self/fd/7 2>/dev/null) || exit 0
-    ident=${post%%|*}; rest=${post#*|}
-    ftype=${rest%%|*}; rest=${rest#*|}
-    fuid=${rest%%|*}; fsize=${rest##*|}
-    if [ "$ident" != "${pre%%|*}" ]; then       # not the object we inspected
-      exec 7<&-
-      continue
-    fi
-    case $ftype in "regular file"|"regular empty file") ;; *) exit 0 ;; esac
-    [ "$fuid" = "$EUID" ] || exit 0             # and only our own
-    [ "$fsize" -le 2 ] 2>/dev/null || exit 0    # one byte plus a newline
-    # `read` reports failure at EOF when the last line has no newline, which is
-    # how state-write leaves it: check the value, not the exit status.
-    IFS= read -r v <&7 2>/dev/null
-    case ${v:-} in 0|1) printf "%s" "$v" ;; esac
-    exit 0
-  done
-'
-
-state_read() {
-  local v
-  state_open_dir 0 || return 0
-  v=$(timeout -s KILL "$STATE_TIMEOUT" /bin/bash -c "$STATE_READ_CHILD" \
-        hwmon-state-read "$STATE_DIR" "$STATE_NAME" 2>/dev/null) || v=
-  state_close_dir
-  case "$v" in 0|1) printf '%s' "$v" ;; esac
-}
-
-# One open creates the temporary file with O_CREAT|O_EXCL|O_NOFOLLOW inside the
-# directory descriptor, and the value is written and fsynced through that same
-# descriptor before it closes. Nothing reopens the name in between, the name
-# itself is unguessable, and O_EXCL refuses it outright if something is sitting
-# there anyway. rename(2) then replaces the destination - symlink or not -
-# without following it, which is also why the old "remove it first" step is
-# gone: that was a check-then-open race of its own, and the rename never needed
-# it.
-STATE_TMP=                # in flight, for the cleanup trap below
-
-# Remove a temporary file that never made it to the rename. The signal traps
-# have to exit as well: a handler returns to where it interrupted, which for a
-# SIGTERM between the create and the rename means carrying on to `mv` a file
-# this just deleted.
-state_cleanup() {
-  [ -n "${STATE_TMP:-}" ] && rm -f -- "$STATE_TMP"
-  STATE_TMP=
-  return 0
-}
-
-state_write() {
-  local v=$1 tmp rand
-  case "$v" in 0|1) ;; *) printf 'hwmon.sh: state-write takes 0 or 1\n' >&2; exit 2 ;; esac
-  state_open_dir 1 || {
-    printf 'hwmon.sh: no state directory we can trust; not saving\n' >&2; exit 1; }
-
-  # A write killed between creating the temporary file and renaming it leaves
-  # that file behind - and the widget's Process objects are torn down, children
-  # and all, whenever the plugin reloads. A predictable name used to make that
-  # self-limiting; an unguessable one would accumulate instead, so sweep the
-  # ones old enough that no live writer can still own them. The trap covers
-  # every death this process can still act on; the sweep covers SIGKILL.
-  find "$STATE_DIR/" -maxdepth 1 -type f -name '.expanded.*' -mmin +1 -delete 2>/dev/null
-
-  rand=$(od -An -N8 -tx1 /dev/urandom 2>/dev/null | tr -dc 'a-f0-9')
-  [ ${#rand} -eq 16 ] || { printf 'hwmon.sh: no randomness for a temporary name\n' >&2; exit 1; }
-  tmp=$STATE_DIR/.expanded.$rand
-  STATE_TMP=$tmp                                # a local would be out of scope
-  trap state_cleanup EXIT
-  trap 'state_cleanup; exit 1' INT TERM HUP
-
-  printf '%s' "$v" | run dd of="$tmp" oflag=nofollow conv=excl,fsync status=none 2>/dev/null
-  [ "${PIPESTATUS[1]}" = 0 ] || { rm -f -- "$tmp"; exit 1; }
-
-  # Both names below are resolved inside the descriptor, so there is nothing
-  # left for a rearranged path to redirect: this is renameat(9, tmp, 9, name).
-  mv -f -- "$tmp" "$STATE_DIR/$STATE_NAME" || { rm -f -- "$tmp"; exit 1; }
-  STATE_TMP=                                    # renamed: nothing left to undo
-  sync -- "$STATE_DIR" 2>/dev/null || :         # the rename itself, durably
-  state_close_dir
 }
 
 # --------------------------------------------------------------------- reaping
@@ -435,28 +195,9 @@ reap() {
   exit 1
 }
 
-# ------------------------------------------------------------------ dispatcher
-# The state operations get a ceiling of their own. Every external helper they
-# run is already time-limited, but opening a name is not a helper: if a FIFO is
-# waiting at one of these paths, the open blocks in the kernel, and a plugin
-# reload could leave the process sitting there. Re-exec under `timeout` once, so
-# the whole operation has an end whatever it is doing. The widget enforces its
-# own deadline on top; this one also covers running the script by hand.
-case "${1:-}" in
-  state-read|state-write)
-    if [ -z "${HWMON_STATE_GUARDED:-}" ] && [ -x /usr/bin/timeout ]; then
-      case $0 in
-        /*) export HWMON_STATE_GUARDED=1
-            exec timeout -s KILL "$STATE_OP_TIMEOUT" "$0" "$@" ;;
-      esac
-    fi ;;
-esac
-
 FULL=0
 case "${1:-}" in
-  state-read)  state_read; exit 0 ;;
-  state-write) state_write "${2:-}"; exit 0 ;;
-  reap)        reap "${2:-}" "${3:-}"; exit 0 ;;
+  reap) reap "${2:-}" "${3:-}"; exit 0 ;;
 esac
 
 for arg in "$@"; do

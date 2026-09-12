@@ -4,6 +4,40 @@ All notable changes to this plugin are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.0] — 2026-09-12
+
+Removes the plugin's own state file. The readout preference is now kept by the
+shell, and the checks that guard this plugin live in the repository.
+
+### Changed
+
+- **The expand/collapse choice is stored in this widget's `shell.json` entry,
+  written by the shell.** Omarchy gives a plugin an API for exactly this — the
+  same one its own tray and clock widgets use for their runtime state — and the
+  shell only lets a plugin write the entry it owns.
+
+  The plugin used to keep a file of its own under `$XDG_STATE_HOME`. Remembering
+  one boolean never needed a file, and having one meant validating a path that
+  any process running as this user could rearrange between the check and the
+  open: two rounds of security review went into getting that right, and 233
+  lines of the backend existed to do it. None of it is needed, so none of it is
+  left. `hwmon.sh` now writes nothing at all, and `state-read` / `state-write`
+  are gone from it.
+
+  Your saved preference moves with you on first use; the now-unused
+  `~/.local/state/omarchy-hwmon/` directory can be deleted.
+
+### Added
+
+- **`tests/`.** The properties that reviews have turned up are pinned as
+  checks: a wedged sample and the helpers under it are
+  torn down while the shell is left alone; a pid that is not ours is refused
+  rather than signalled; a planted binary earlier in `PATH` changes nothing; a
+  hostile process name cannot break the JSON; the backend creates no files; and
+  the repository keeps the shape the marketplace's automated baseline expects.
+  `tests/run-tests.sh` runs them all, and the one that needs a real Quickshell
+  skips itself without one.
+
 ## [1.3.0] — 2026-09-12
 
 Closes the two findings from the third marketplace security review, and takes

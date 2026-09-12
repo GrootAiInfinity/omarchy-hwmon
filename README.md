@@ -79,11 +79,10 @@ omarchy plugin remove io.github.grootaiinfinity.hwmon
 ```
 
 Removal takes the widget out of the bar and deletes the plugin directory. The
-one file the plugin writes outside it is the remembered expand/collapse choice:
-
-```sh
-rm -rf ~/.local/state/omarchy-hwmon
-```
+plugin writes nothing outside it, so there is nothing else to clean up. (Up to
+v1.3.0 it kept the remembered readout choice in `~/.local/state/omarchy-hwmon/`;
+if you used one of those versions, that directory is now unused and safe to
+delete.)
 
 ## Configuration
 
@@ -94,10 +93,9 @@ One setting, `expanded`, exposed in the manifest and settable per bar entry in
 { "id": "io.github.grootaiinfinity.hwmon", "expanded": true }
 ```
 
-It is the **initial** value only. Once you toggle the readout at runtime
-(right-click or scroll) that choice is saved to
-`~/.local/state/omarchy-hwmon/expanded` and wins from then on; delete that file
-to go back to the configured default.
+Toggling the readout at runtime (right-click or scroll) changes this same
+value: the shell writes it back to that entry, the way it does for its own
+tray and clock widgets. There is no second place the preference lives.
 
 ### Scripting
 
@@ -132,11 +130,12 @@ The plugin is read-only with respect to your system.
   `class/hwmon/*` (temperatures and fans), `class/net/*/statistics`,
   `class/drm/card*/device`, `class/power_supply/BAT*`, `block/*`,
   `devices/system/cpu/*/cpufreq`, `devices/virtual/dmi/id`.
-- **Runs:** `jq`, `df`, `ps`, `uname`, `awk`, the coreutils it uses for the
-  state file (`stat`, `dd`, `od`, `sync`, `mv`, `find`) and `timeout`, and —
+- **Runs:** `jq`, `df`, `ps`, `uname`, `awk`, `timeout` and `setsid`, and —
   only while the panel is open — `nvidia-smi` and `lspci`.
-- **Writes:** one file, `~/.local/state/omarchy-hwmon/expanded`, containing `0`
-  or `1`. It never edits `shell.json` or any other file you own.
+- **Writes:** nothing. The one preference it remembers is stored by the shell in
+  this widget's own entry in `shell.json`, through the API Omarchy gives a
+  plugin for exactly that; the shell only lets a plugin write the entry it owns.
+  The backend touches no file at all.
 - **Values that come from outside** — process names, mount points, device and
   GPU model strings — are encoded as JSON by `jq` and rendered as
   `Text.PlainText`, so they cannot break the output or promote themselves to
@@ -146,15 +145,10 @@ The plugin is read-only with respect to your system.
   absolute path with an empty environment, and resets `PATH` to root-owned
   system directories before calling any helper, so a binary planted earlier in
   your `PATH` cannot stand in for `jq`, `df` or `nvidia-smi`.
-- **The state file is judged by what was opened, not by its name.** A symlink,
-  a FIFO, a file someone else owns, or anything larger than two bytes is
-  ignored rather than loaded. Because any path can be exchanged in the moment
-  between a check and an open, every question is asked of an open descriptor:
-  the state directory is walked one component at a time from the filesystem
-  root, each component is verified to be the same object after it was opened as
-  before, and the descriptor that survives that walk is what the read, the
-  create, the rename and the fsync all go through — so nothing later re-resolves
-  a path that could have changed underneath it.
+- **There is no file of its own to attack.** Earlier versions kept the readout
+  preference in `$XDG_STATE_HOME`, which meant validating a path that any
+  process running as this user could rearrange between the check and the open.
+  Handing that one boolean to the shell removes the question entirely.
 - **A sample that hangs is taken apart, not trusted to stop.** Each one runs in
   its own process group under a deadline; if it ignores the request to stop, the
   group is torn down — after the backend re-checks from `/proc` that the process
@@ -203,12 +197,28 @@ does not expose it.
 - Category: `Hardware`
 - Tags: `bar`, `quickshell`, `system`
 
+## Checks
+
+The behaviour this plugin is expected to hold to is pinned by tests rather than
+by prose — that a wedged sample and the helpers under it are actually torn down,
+that a planted binary earlier in `PATH` changes nothing, that a hostile process
+name cannot break the JSON, that the backend writes no files, and that the
+repository keeps the shape the marketplace baseline expects:
+
+```sh
+tests/run-tests.sh
+```
+
+They run on any Linux box; the one that drives a real Quickshell skips itself
+where none is installed.
+
 ## Contributing
 
 Issues and pull requests are welcome at
 <https://github.com/GrootAiInfinity/omarchy-hwmon>. Keep `hwmon.sh` free of
-machine-specific paths, and route anything that ends up in the JSON through
-`jq` rather than hand-written string formatting.
+machine-specific paths, route anything that ends up in the JSON through `jq`
+rather than hand-written string formatting, and add a check under `tests/` for
+anything that would be a bug if it came back.
 
 ## License
 

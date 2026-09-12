@@ -45,11 +45,18 @@ Panel {
   }
 
   property var stats: ({})
-  property bool expanded: false
-  // Set once the saved toggle has been resolved, so the manifest default can't
-  // land on top of it. `settings` arrives a tick after Component.onCompleted,
-  // and the file read finishes whenever it finishes.
-  property bool stateResolved: false
+
+  // The bar readout's expand/collapse choice is simply this widget's own
+  // setting: one value, read here and written by the shell. `settings` is
+  // injected a tick after Component.onCompleted, so this starts at the manifest
+  // default and follows the saved value the moment it arrives - no resolving,
+  // no ordering to get wrong.
+  readonly property bool expanded: !!root.setting("expanded", false)
+
+  // The shell injects this into a plugin root that declares it; the bar carries
+  // the same handle for widgets that reach it that way.
+  property var shell: null
+  readonly property var shellApi: root.shell || (root.bar ? root.bar.shell : null)
 
   readonly property int cpuPct: Math.round(Number(stats.cpu_pct) || 0)
   readonly property int memPct: Math.round(Number(stats.mem_pct) || 0)
@@ -151,41 +158,30 @@ Panel {
     }
   }
 
-  // Reading and writing the saved toggle is the backend's job. The QML file API
-  // cannot ask whether a path is a regular file, who owns it or how big it is,
-  // so a symlink left at the state path would have been followed and its
-  // contents read into the shell process. hwmon.sh checks all of that, and
-  // writes through a private directory it owns.
-  property var pendingState: null
+  // Persisting that choice is the shell's job, not this plugin's. The shell
+  // writes the widget's own entry in shell.json on request - the same call
+  // Omarchy's tray and clock use for their runtime state - and it will only
+  // write the entry belonging to the plugin that asks.
+  //
+  // This plugin used to keep a file of its own under $XDG_STATE_HOME instead.
+  // That meant validating a path that any process running as this user could
+  // rearrange underneath it, which is a hard thing to get right and was the
+  // subject of two rounds of security review. Remembering one boolean never
+  // needed a file, and now there is not one to get wrong.
+  function save(key, value) {
+    var entry = { id: root.moduleName }
+    for (var k in root.settings) if (k !== "id") entry[k] = root.settings[k]
+    entry[key] = value
+    // Applied here first so the readout changes on the click itself; the
+    // shell.json write comes back through the bar as the same value.
+    root.settings = entry
+    if (root.shellApi && typeof root.shellApi.updateEntryInline === "function")
+      root.shellApi.updateEntryInline(root.moduleName, entry)
+  }
 
   function setExpanded(v) {
     if (root.expanded === v) return
-    root.expanded = v
-    root.stateResolved = true
-    if (stateWrite.running) { root.pendingState = v; return }
-    root.writeState(v)
-  }
-
-  function writeState(v) {
-    stateWrite.start([root.script, "state-write", v ? "1" : "0"])
-  }
-
-  function applyState(raw) {
-    var t = String(raw).trim()
-    if (t === "0" || t === "1") {
-      root.expanded = (t === "1")
-      root.stateResolved = true
-      return
-    }
-    // Nothing saved yet, or the backend refused the state file as unsafe: fall
-    // back to the manifest setting, which the shell injects a tick after
-    // onCompleted - hence the deferred read.
-    Qt.callLater(function () {
-      if (!root.stateResolved) {
-        root.expanded = root.setting("expanded", false)
-        root.stateResolved = true
-      }
-    })
+    root.save("expanded", !!v)
   }
 
   IpcHandler {
@@ -205,7 +201,6 @@ Panel {
 
   Component.onCompleted: {
     lastSampleMs = Date.now()
-    stateRead.start([root.script, "state-read"])
     refresh()
   }
 
@@ -293,27 +288,6 @@ Panel {
     id: statsRun
     deadlineMs: 10000
     onFinished: function (text) { root.parseStats(text) }
-  }
-
-  // The state helpers have ceilings of their own inside hwmon.sh (eight seconds
-  // for the whole operation, two for the one open that can block). This is the
-  // outer bound for the case where even that does not come back.
-  Guarded {
-    id: stateRead
-    deadlineMs: 12000
-    onFinished: function (text) { root.applyState(text) }
-  }
-
-  Guarded {
-    id: stateWrite
-    deadlineMs: 12000
-    onFinished: function (text) {
-      if (root.pendingState === null) return
-      var v = root.pendingState
-      root.pendingState = null
-      if (v !== root.expanded) return
-      root.writeState(v)
-    }
   }
 
   // Reaps are rare and run one at a time. A second request arriving while one
