@@ -4,6 +4,91 @@ All notable changes to this plugin are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.0] — 2026-09-12
+
+Closes the two findings from the third marketplace security review, and takes
+the temperature path off `lm_sensors`, which halves what a sample costs.
+
+### Security
+
+- **The state directory is now held as a descriptor, not re-resolved as a
+  path.** Both directions validated the directory and then reached back through
+  it by name for every later step — the create, the rename, the read — so a
+  same-user process that exchanged an intermediate directory after the check
+  had the write redirected into a directory of its own choosing, and the read
+  answered from one. The descriptor-identity check added in 1.2.1 covered only
+  the final entry, not the components above it.
+
+  The directory is now walked one component at a time from the filesystem root:
+  each component is lstat'd, opened, and fstat'd through its own descriptor,
+  and the device/inode pair has to match across the open, so a component
+  swapped for a symlink or for another directory is rejected rather than
+  followed. Ownership, type and permissions are asked of that descriptor.
+  Everything afterwards addresses the entry as `/proc/self/fd/9/expanded`,
+  which is `openat(9, "expanded")` — the create, the read, the rename, the
+  unlink and the fsync all land in the object the walk validated, with no path
+  left above it to re-traverse. Reproduced before fixing, with a one-second
+  window at the check-to-use gap: the old code wrote the state into the
+  attacker's directory and read back the attacker's value; the new code does
+  neither, and lands in the directory it validated even when the whole path is
+  rearranged mid-operation.
+
+- **Directory permissions were only half-checked.** The "group- or
+  other-writable" test matched the last character of the mode, so a state
+  directory that was group-writable but not world-writable passed it.
+
+- **Escalation no longer depends on what the QML side believes.** The watchdog
+  recorded a pid, asked the process to stop, and three seconds later the
+  escalation re-checked Quickshell's `running` flag before acting. The flag
+  does stay true while a process ignores SIGTERM (measured: the old path did
+  fire and did kill the group), but it goes false the moment the sample itself
+  exits — and its helpers do not exit with it. A wedged `nvidia-smi` under a
+  sample that died on SIGTERM was left running indefinitely, holding the pipe.
+
+  The escalation is now keyed on the recorded pid alone and runs whatever this
+  side believes. What it does about that pid is `hwmon.sh reap`'s decision:
+  the target must still be its own process group and session leader, must have
+  been running at least as long as the deadline that was waiting on it (so a
+  recycled pid is refused, not killed), must still be running this script, and
+  must not be our own group. If the leader has already gone, the group is swept
+  anyway — but only while nothing has taken the leader's pid, and only for
+  members that predate the deadline. Between the group's TERM and its KILL the
+  group is re-examined, and a member newer than the deadline stops the teardown
+  rather than being caught in it.
+
+- **The state operations now have a whole-operation ceiling.** Every helper they
+  run was already time-limited, but opening a name is not a helper: a FIFO left
+  at one of these paths blocks in the kernel. `state-read` / `state-write`
+  re-exec themselves once under `timeout`, and the widget applies a deadline of
+  its own on top, with the same reaper behind it.
+
+### Changed
+
+- **Temperatures and fans come from `/sys/class/hwmon` directly; `lm_sensors` is
+  no longer a dependency.** `sensors -j` cost 75–110 ms per sample — about half
+  the work in a sample that runs every 1.5–3 seconds — and brought with it a
+  256 KB buffer, three `jq` passes to dig the values back out, and a chip name
+  derived from a PCI address, which is what silently broke GPU temperature on
+  this hardware once before. Each GPU's temperature now comes from that card's
+  own `hwmon` directory, so there is no name to derive and no way to attribute
+  one card's reading to another. The values are identical; the CPU sensor is
+  still `k10temp` Tdie/Tctl/Tccd, then `coretemp` "Package id", then the hottest
+  sensor on the machine labelled `SYS`.
+- **A sample costs about half of what it did.** The helpers called forty-odd
+  times per sample (`num`, `squish`, rounding) were an `awk` each and are now
+  bash; `/proc/stat` is read with `mapfile` rather than `grep` or a `read` loop
+  (bash's `read` goes to the kernel a byte at a time, which on a large `/proc`
+  file costs more than everything else in the sample together); `nproc` and one
+  `uname` are gone, the thread count coming from the topology pass that already
+  reads `/proc/cpuinfo`; and the expensive sensors — vendor WMI chips and
+  `acpitz`, which evaluate ACPI methods — are only read when there is no CPU
+  package sensor to ask instead. Measured on this machine: 0.74 s → 0.51 s of
+  wall clock per light sample, 0.40 s → 0.23 s of CPU.
+- **Fan speeds are collected only while the panel is open**, like the storage
+  list and the top processes, since that is the only place they are shown.
+- `squish` also flattens embedded newlines now, which the tab-separated rows it
+  feeds have always assumed.
+
 ## [1.2.3] — 2026-09-11
 
 Stops a read from being refused because the widget itself was writing. No

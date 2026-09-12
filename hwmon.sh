@@ -9,6 +9,9 @@
 #   hwmon.sh state-read     Print the saved bar-readout choice (0 or 1), if the
 #                           state file passes its safety checks.
 #   hwmon.sh state-write 0|1  Save that choice.
+#   hwmon.sh reap PID AGE   Tear down a sample that outlived its deadline, after
+#                           re-checking from /proc that PID is still the leader
+#                           of a group of ours at least AGE seconds old.
 #   hwmon.sh --help         Usage.
 #
 # Output is a single line of JSON on stdout. Missing metrics are emitted as
@@ -22,7 +25,7 @@
 #
 # The interpreter is an absolute path and PATH is replaced with root-owned
 # system directories before any helper runs, so a binary planted earlier in the
-# caller's PATH cannot stand in for jq, sensors, df, ps, nvidia-smi or lspci.
+# caller's PATH cannot stand in for jq, df, ps, nvidia-smi or lspci.
 # The widget additionally launches this script with an empty environment.
 
 set -u
@@ -42,7 +45,6 @@ SAMPLE_INTERVAL=0.35
 # producers is external. Cap each one where it is produced: the QML collector
 # on the other end buffers whatever arrives with no limit of its own, so a
 # runaway or hostile helper would otherwise grow the shell's heap unbounded.
-MAX_SENSORS=262144        # sensors -j, the biggest legitimate input
 MAX_SMI=4096              # four short CSV fields
 MAX_LSPCI=65536           # one device line
 MAX_DF=65536              # one line per mount
@@ -61,6 +63,7 @@ usage() {
 Usage: hwmon.sh [stats] [--full]
        hwmon.sh state-read
        hwmon.sh state-write 0|1
+       hwmon.sh reap PID MIN_AGE_SECONDS
        hwmon.sh --help
 
   stats        Emit one line of JSON describing the current hardware state.
@@ -69,56 +72,148 @@ Usage: hwmon.sh [stats] [--full]
                only asks for it while its panel is open.
   state-read   Print the saved bar-readout choice, or nothing.
   state-write  Save it.
+  reap         Tear down a wedged sample's process group, identity re-checked
+               from /proc first. The widget's watchdog is what asks for this.
 EOF
 }
 
 # ------------------------------------------------------------------ state file
-# Where the expand/collapse choice lives. The widget used to read and write this
-# through the QML file API, which has no way to ask whether the path is a
-# regular file, who owns it, or how big it is - so a symlink left at that path
-# would have been followed and its contents handed to the shell process. Both
-# directions now go through here, where those questions can be answered.
+# The expand/collapse choice is the only thing this plugin writes. It lives
+# under $XDG_STATE_HOME (or $HOME/.local/state), inside directories that any
+# process running as this user can rearrange while we are working in them, so
+# nothing below trusts a *pathname*.
 #
-# Answering them about a *pathname* is not enough. Between the check and the
-# open, the entry can be exchanged for a symlink: the checks then describe one
-# object and the open returns another, which is how a two-byte limit turns into
-# an unbounded read of someone else's file. So nothing below trusts a name.
-# The read validates the descriptor it actually opened, and the write creates
-# its temporary file with O_EXCL|O_NOFOLLOW and never reopens it by name.
+# Two rounds of review each removed a different way for a name to stop
+# describing the object it named. The first was in the final entry: validate
+# the path, then open the path, and a symlink swapped in between turned a
+# two-byte read into an unbounded one. The second is in the directories above
+# it: validating a directory and then reaching back through it by name for
+# every later step re-resolves the whole path each time, so a directory
+# exchanged after the check silently receives the create, the rename, or the
+# read.
+#
+# What closes both is holding a descriptor and never letting go. The state
+# directory is opened one component at a time starting at the filesystem root:
+# each component is lstat'd by name, opened, then fstat'd through its
+# descriptor, and the device/inode pair must match across the open - so a
+# component exchanged for a symlink, or for another directory, is rejected
+# rather than followed. Ownership, type and permissions are then asked of that
+# descriptor, never of the name.
+#
+# The descriptor that survives the walk *is* the directory, not a route to it.
+# "/proc/self/fd/9/expanded" is openat(9, "expanded"): the kernel jumps to the
+# directory the descriptor pins and resolves one name inside it, with no path
+# above it to re-traverse. That is how the create, the read, the rename, the
+# unlink and the fsync below all land in the object the walk validated, whatever
+# happens to the path in the meantime - bash has no openat/renameat/unlinkat of
+# its own, and this is the equivalent the kernel provides. Every step is a plain
+# operation on that one name, so there is no second component left to race.
 
-state_path() {
+PROCFD=/proc/self/fd
+STATE_DIR=$PROCFD/9       # the validated state directory, named by descriptor
+STATE_NAME=expanded       # the one entry in it
+STATE_OP_TIMEOUT=8        # whole-operation ceiling, see the dispatcher below
+
+state_dir_path() {
   local base=${XDG_STATE_HOME:-}
   [ -n "$base" ] || base=${HOME:-}/.local/state
-  [ "$base" = "/.local/state" ] && return 1     # no HOME: nowhere to persist
-  printf '%s/omarchy-hwmon/expanded' "${base%/}"
+  [ -n "${XDG_STATE_HOME:-}${HOME:-}" ] || return 1   # nowhere to persist
+  case $base in /*) ;; *) return 1 ;; esac             # must be absolute
+  printf '%s/omarchy-hwmon' "${base%/}"
 }
 
-# A directory is only usable if it is a real directory we own that nobody else
-# can write to.
-dir_is_safe() {
-  local d=$1 perm
-  [ -L "$d" ] && return 1
-  [ -d "$d" ] || return 1
-  [ -O "$d" ] || return 1
-  perm=$(stat -c %a -- "$d" 2>/dev/null) || return 1
-  case "$perm" in *[2367]) return 1 ;; esac     # group- or other-writable
+# Ownership and permissions for one directory on the walk, asked of the
+# descriptor. The final directory has to be ours and closed to everyone else.
+# The ones above it have to be ours or root's, and may be writable by others
+# only when they are sticky - /tmp is the one legitimate case of that, and the
+# sticky bit is exactly what stops another user from swapping our entry out of
+# it.
+dir_policy_ok() {
+  local uid=$1 mode=$2 final=$3 perm special grp oth
+  perm=${mode: -3}; special=${mode%"$perm"}
+  grp=${perm:1:1}; oth=${perm:2:1}
+  if [ "$final" = 1 ]; then
+    [ "$uid" = "$EUID" ] || return 1
+    case $grp$oth in *[2367]*) return 1 ;; esac
+  else
+    [ "$uid" = "$EUID" ] || [ "$uid" = 0 ] || return 1
+    case $grp$oth in
+      *[2367]*) case $special in *[1357]) ;; *) return 1 ;; esac ;;
+    esac
+  fi
   return 0
 }
 
-# Bash cannot ask a redirection for O_NOFOLLOW, so identity is settled around
-# the open instead: lstat the name, open it, fstat the descriptor through
-# /dev/fd, and require the same device and inode. A symlink resolves to a
-# different inode than the link itself, and a file swapped in at any point
-# either side of the open has a different inode too, so both are rejected -
-# and every remaining question (type, owner, size) is asked of the descriptor,
-# never of the name.
+# Descend one component, leaving it open on fd 9 (fd 8 is the scratch the new
+# descriptor arrives on). The lstat is resolved from fd 9 too, so even the name
+# being inspected is looked up inside the directory we already hold.
+state_step() {
+  local comp=$1 final=$2 pre post ident ftype uid mode
+  pre=$(stat -c '%d:%i|%F' -- "$STATE_DIR/$comp" 2>/dev/null) || return 1
+  [ "${pre#*|}" = directory ] || return 1        # symlink, file, FIFO, device
+  exec 8<"$STATE_DIR/$comp" 2>/dev/null || return 1
+  post=$(stat -L -c '%d:%i|%F|%u|%a' "$PROCFD/8" 2>/dev/null) || { exec 8<&-; return 1; }
+  ident=${post%%|*}; post=${post#*|}
+  ftype=${post%%|*}; post=${post#*|}
+  uid=${post%%|*}; mode=${post##*|}
+  if [ "$ident" != "${pre%%|*}" ] ||                 # swapped across the open
+     [ "$ftype" != directory ] ||
+     ! dir_policy_ok "$uid" "$mode" "$final"; then
+    exec 8<&-
+    return 1
+  fi
+  exec 9<&8
+  exec 8<&-
+}
+
+state_close_dir() { exec 9<&- 2>/dev/null; return 0; }
+
+# Walk to the state directory and leave it on fd 9. With $1 = 1 (writes only)
+# a missing component is created as we go - inside the directory we are
+# holding, never at a path resolved again from the top.
+state_open_dir() {
+  local create=${1:-0} path comp rest final
+  path=$(state_dir_path) || return 1
+  [ -d /proc/self/fd ] || return 1        # no /proc: refuse rather than guess
+  exec 9</ 2>/dev/null || return 1        # the anchor: / is root's, or nothing is
+  rest=${path#/}
+  while [ -n "$rest" ]; do
+    case $rest in
+      */*) comp=${rest%%/*}; rest=${rest#*/}; final=0 ;;
+      *)   comp=$rest;       rest="";         final=1 ;;
+    esac
+    case $comp in
+      '') continue ;;                     # a doubled slash names nothing
+      .|..) state_close_dir; return 1 ;;  # not validatable component by component
+    esac
+    # `mkdir -p` used to create the whole chain; with the walk it is created
+    # the same way it is validated, one component at a time inside the
+    # directory we are holding. A failure is ignored here - whatever is at the
+    # name still has to pass the step below.
+    if [ "$create" = 1 ] && [ ! -e "$STATE_DIR/$comp" ]; then
+      mkdir -m 700 -- "$STATE_DIR/$comp" 2>/dev/null || :
+    fi
+    state_step "$comp" "$final" || { state_close_dir; return 1; }
+  done
+  return 0
+}
+
+# Read the value through the retained directory descriptor.
 #
-# This runs in a child under `timeout` because the open is the one step that
-# can block: a FIFO left at the path waits for a writer that never comes, and
-# a read stuck here would hold the widget's single in-flight slot for good.
+# Identity is settled around the open here as well: lstat the name inside fd 9,
+# open it, fstat that descriptor, and require the same device and inode. A
+# symlink resolves to a different inode than the link itself, so no-follow falls
+# out of the same comparison, and type, owner and size are all asked of the
+# descriptor.
+#
+# This runs in a child under `timeout` because the open is the one step that can
+# block: a FIFO left at the name waits for a writer that never comes, and a read
+# stuck there would hold the widget's single in-flight sampling slot for good.
+# The child inherits fd 9, and /proc/self/fd/9 in the child is that same
+# directory.
 STATE_READ_CHILD='
   set -u
-  f=$1
+  d=$1; name=$2
   # The widget replaces this file by rename whenever the toggle changes, so a
   # changed inode is far more often our own write than an attacker - a read
   # racing one was refused about 3% of the time, and at startup that silently
@@ -129,18 +224,18 @@ STATE_READ_CHILD='
   n=0
   while [ $n -lt 5 ]; do
     n=$((n + 1))
-    pre=$(stat -c "%d:%i|%F" -- "$f" 2>/dev/null) || exit 0   # lstat: no follow
+    pre=$(stat -c "%d:%i|%F" -- "$d/$name" 2>/dev/null) || exit 0   # lstat: no follow
     case ${pre#*|} in
       "regular file"|"regular empty file") ;;
       *) exit 0 ;;                              # symlink, FIFO, device, dir
     esac
-    exec 9<"$f" 2>/dev/null || exit 0
-    post=$(stat -L -c "%d:%i|%F|%u|%s" /dev/fd/9 2>/dev/null) || exit 0
+    exec 7<"$d/$name" 2>/dev/null || exit 0
+    post=$(stat -L -c "%d:%i|%F|%u|%s" /proc/self/fd/7 2>/dev/null) || exit 0
     ident=${post%%|*}; rest=${post#*|}
     ftype=${rest%%|*}; rest=${rest#*|}
     fuid=${rest%%|*}; fsize=${rest##*|}
     if [ "$ident" != "${pre%%|*}" ]; then       # not the object we inspected
-      exec 9<&-
+      exec 7<&-
       continue
     fi
     case $ftype in "regular file"|"regular empty file") ;; *) exit 0 ;; esac
@@ -148,29 +243,29 @@ STATE_READ_CHILD='
     [ "$fsize" -le 2 ] 2>/dev/null || exit 0    # one byte plus a newline
     # `read` reports failure at EOF when the last line has no newline, which is
     # how state-write leaves it: check the value, not the exit status.
-    IFS= read -r v <&9 2>/dev/null
+    IFS= read -r v <&7 2>/dev/null
     case ${v:-} in 0|1) printf "%s" "$v" ;; esac
     exit 0
   done
 '
 
 state_read() {
-  local f d v
-  f=$(state_path) || return 0
-  d=${f%/*}
-  dir_is_safe "$d" || return 0
+  local v
+  state_open_dir 0 || return 0
   v=$(timeout -s KILL "$STATE_TIMEOUT" /bin/bash -c "$STATE_READ_CHILD" \
-        hwmon-state-read "$f" 2>/dev/null) || return 0
+        hwmon-state-read "$STATE_DIR" "$STATE_NAME" 2>/dev/null) || v=
+  state_close_dir
   case "$v" in 0|1) printf '%s' "$v" ;; esac
 }
 
-# One open creates the temporary file with O_CREAT|O_EXCL|O_NOFOLLOW, and the
-# value is written and fsynced through that same descriptor before it closes.
-# Nothing reopens the name in between, the name itself is unguessable, and
-# O_EXCL refuses the path outright if something is sitting there anyway.
-# rename(2) then replaces the destination - symlink or not - without following
-# it, which is also why the old "remove it first" step is gone: that was a
-# check-then-open race of its own, and the rename never needed it.
+# One open creates the temporary file with O_CREAT|O_EXCL|O_NOFOLLOW inside the
+# directory descriptor, and the value is written and fsynced through that same
+# descriptor before it closes. Nothing reopens the name in between, the name
+# itself is unguessable, and O_EXCL refuses it outright if something is sitting
+# there anyway. rename(2) then replaces the destination - symlink or not -
+# without following it, which is also why the old "remove it first" step is
+# gone: that was a check-then-open race of its own, and the rename never needed
+# it.
 STATE_TMP=                # in flight, for the cleanup trap below
 
 # Remove a temporary file that never made it to the rename. The signal traps
@@ -184,13 +279,10 @@ state_cleanup() {
 }
 
 state_write() {
-  local v=$1 f d tmp rand
+  local v=$1 tmp rand
   case "$v" in 0|1) ;; *) printf 'hwmon.sh: state-write takes 0 or 1\n' >&2; exit 2 ;; esac
-  f=$(state_path) || exit 1
-  d=${f%/*}
-  [ -L "$d" ] && { printf 'hwmon.sh: state directory is a symlink, refusing\n' >&2; exit 1; }
-  [ -d "$d" ] || mkdir -m 700 -p -- "$d" 2>/dev/null
-  dir_is_safe "$d" || { printf 'hwmon.sh: state directory is not a private directory we own\n' >&2; exit 1; }
+  state_open_dir 1 || {
+    printf 'hwmon.sh: no state directory we can trust; not saving\n' >&2; exit 1; }
 
   # A write killed between creating the temporary file and renaming it leaves
   # that file behind - and the widget's Process objects are torn down, children
@@ -198,11 +290,11 @@ state_write() {
   # self-limiting; an unguessable one would accumulate instead, so sweep the
   # ones old enough that no live writer can still own them. The trap covers
   # every death this process can still act on; the sweep covers SIGKILL.
-  find "$d" -maxdepth 1 -type f -name '.expanded.*' -mmin +1 -delete 2>/dev/null
+  find "$STATE_DIR/" -maxdepth 1 -type f -name '.expanded.*' -mmin +1 -delete 2>/dev/null
 
   rand=$(od -An -N8 -tx1 /dev/urandom 2>/dev/null | tr -dc 'a-f0-9')
   [ ${#rand} -eq 16 ] || { printf 'hwmon.sh: no randomness for a temporary name\n' >&2; exit 1; }
-  tmp=$d/.expanded.$rand
+  tmp=$STATE_DIR/.expanded.$rand
   STATE_TMP=$tmp                                # a local would be out of scope
   trap state_cleanup EXIT
   trap 'state_cleanup; exit 1' INT TERM HUP
@@ -210,18 +302,161 @@ state_write() {
   printf '%s' "$v" | run dd of="$tmp" oflag=nofollow conv=excl,fsync status=none 2>/dev/null
   [ "${PIPESTATUS[1]}" = 0 ] || { rm -f -- "$tmp"; exit 1; }
 
-  # The directory is the only thing left that the rename could be redirected
-  # through, so confirm it is still ours and still private before committing.
-  dir_is_safe "$d" || { rm -f -- "$tmp"; exit 1; }
-  mv -f -- "$tmp" "$f" || { rm -f -- "$tmp"; exit 1; }
+  # Both names below are resolved inside the descriptor, so there is nothing
+  # left for a rearranged path to redirect: this is renameat(9, tmp, 9, name).
+  mv -f -- "$tmp" "$STATE_DIR/$STATE_NAME" || { rm -f -- "$tmp"; exit 1; }
   STATE_TMP=                                    # renamed: nothing left to undo
-  sync -- "$d" 2>/dev/null || :                 # the rename itself, durably
+  sync -- "$STATE_DIR" 2>/dev/null || :         # the rename itself, durably
+  state_close_dir
 }
+
+# --------------------------------------------------------------------- reaping
+# The widget asks for this when a sample has outlived its deadline and ignored
+# SIGTERM. Everything it acts on is re-derived from /proc here rather than taken
+# on trust from the QML side, which knows only a number that was a pid when the
+# watchdog fired:
+#
+#   - the target must still be its own process group and session leader, which
+#     is what `setsid` made it and what makes a group kill safe;
+#   - it must have been running for at least the deadline the widget was
+#     waiting on, so a pid recycled since then is refused rather than killed;
+#   - its command line must be this script, so an unrelated process that
+#     inherited the number is refused as well;
+#   - and the group must not be our own.
+#
+# If the leader has already gone, its descendants can still be holding the pipe,
+# so the group is swept anyway - but only when nothing has taken the leader's
+# pid, and only for members old enough to predate the deadline.
+#
+# "Reaping" here means confirming the group is gone: the direct child belongs to
+# the shell's own process table (Quickshell waits on it), and anything below it
+# is reparented to init, which reaps it.
+REAP_SETTLE=20            # 100ms each, so two seconds between TERM and KILL
+HWMON_SELF=$0             # what a process of ours has in its command line
+CLK_TCK=100               # replaced with the real value before it is used
+PSTAT_PGRP=; PSTAT_SID=; PSTAT_START=; PSTAT_AGE=
+
+# Sets PSTAT_PGRP / PSTAT_SID / PSTAT_START for a pid, without forking: the
+# group sweep below walks every process on the machine, and a command
+# substitution there would cost a subshell per process per pass.
+proc_stat_fields() {      # $1 = pid
+  local line after
+  # The stderr redirection comes first on purpose: a process that exits while
+  # the sweep is walking /proc makes the *input* redirection fail, and bash
+  # reports that before a later 2>/dev/null would have applied.
+  IFS= read -r line 2>/dev/null < "/proc/$1/stat" || return 1
+  # comm sits in parentheses and may contain spaces and ')' - only the last
+  # ") " in the line ends it, because no field after it contains that pair.
+  after=${line##*') '}
+  local -a f=($after)
+  [ ${#f[@]} -ge 20 ] || return 1
+  PSTAT_PGRP=${f[2]}; PSTAT_SID=${f[3]}; PSTAT_START=${f[19]}
+  return 0
+}
+
+proc_age() {              # $1 = starttime in clock ticks; sets PSTAT_AGE
+  local up
+  IFS='. ' read -r up _ < /proc/uptime 2>/dev/null || return 1
+  PSTAT_AGE=$(( up - $1 / CLK_TCK ))
+  return 0
+}
+
+proc_is_ours() {          # $1 = pid: does its command line name this script?
+  local a
+  while IFS= read -r -d '' a; do
+    [ "$a" = "$HWMON_SELF" ] && return 0
+  done 2>/dev/null < "/proc/$1/cmdline"
+  return 1
+}
+
+# True when no process is left in the group, and while walking it, refuses the
+# sweep outright if a member is younger than $2 - a group that gained a new
+# member since the deadline is a pid that has been recycled, not our sample.
+group_gone() {            # $1 = pgid, $2 = minimum age of any member
+  local p
+  for p in /proc/[0-9]*; do
+    p=${p##*/}
+    proc_stat_fields "$p" || continue
+    [ "$PSTAT_PGRP" = "$1" ] || continue
+    proc_age "$PSTAT_START" || return 1
+    [ "$PSTAT_AGE" -ge "$2" ] 2>/dev/null || return 2   # too young: not ours
+    return 1
+  done
+  return 0
+}
+
+reap() {
+  local pid=${1:-} minage=${2:-0} own i rc
+  case $pid in *[!0-9]*|'') printf 'hwmon.sh: reap takes a pid\n' >&2; exit 2 ;; esac
+  case $minage in *[!0-9]*|'') minage=0 ;; esac
+  [ "$pid" -gt 1 ] 2>/dev/null || exit 2
+  CLK_TCK=$(getconf CLK_TCK 2>/dev/null) || CLK_TCK=100
+  [ "$CLK_TCK" -gt 0 ] 2>/dev/null || CLK_TCK=100
+
+  proc_stat_fields $$ || exit 1
+  own=$PSTAT_PGRP
+  [ "$pid" != "$own" ] || exit 1                   # never our own group
+
+  if proc_stat_fields "$pid"; then
+    # A pid that came back as something else since the watchdog fired fails at
+    # least one of these, and nothing is signalled.
+    [ "$PSTAT_PGRP" = "$pid" ] && [ "$PSTAT_SID" = "$pid" ] || exit 1
+    [ "$PSTAT_PGRP" != "$own" ] || exit 1
+    proc_age "$PSTAT_START" || exit 1
+    [ "$PSTAT_AGE" -ge "$minage" ] 2>/dev/null || exit 1
+    proc_is_ours "$pid" || exit 1
+  else
+    # The leader is gone. Sweeping its group is only safe while no new process
+    # holds that number, and only if every survivor predates the deadline.
+    group_gone "$pid" "$minage"; rc=$?
+    [ "$rc" = 0 ] && exit 0
+    [ "$rc" = 1 ] || exit 1
+  fi
+
+  # Between signals the group is re-examined rather than assumed: if something
+  # newer than the deadline has appeared in it, the numbers have been recycled
+  # underneath us and the right move is to stop signalling, not to press on.
+  settle() {
+    local i rc
+    for ((i = 0; i < REAP_SETTLE; i++)); do
+      group_gone "$pid" "$minage"; rc=$?
+      [ "$rc" = 0 ] && exit 0
+      [ "$rc" = 2 ] && exit 1
+      sleep 0.1
+    done
+    return 0
+  }
+
+  kill -TERM -- "-$pid" 2>/dev/null || :
+  settle
+  kill -KILL -- "-$pid" 2>/dev/null || :
+  settle
+  printf 'hwmon.sh: process group %s outlived SIGKILL\n' "$pid" >&2
+  exit 1
+}
+
+# ------------------------------------------------------------------ dispatcher
+# The state operations get a ceiling of their own. Every external helper they
+# run is already time-limited, but opening a name is not a helper: if a FIFO is
+# waiting at one of these paths, the open blocks in the kernel, and a plugin
+# reload could leave the process sitting there. Re-exec under `timeout` once, so
+# the whole operation has an end whatever it is doing. The widget enforces its
+# own deadline on top; this one also covers running the script by hand.
+case "${1:-}" in
+  state-read|state-write)
+    if [ -z "${HWMON_STATE_GUARDED:-}" ] && [ -x /usr/bin/timeout ]; then
+      case $0 in
+        /*) export HWMON_STATE_GUARDED=1
+            exec timeout -s KILL "$STATE_OP_TIMEOUT" "$0" "$@" ;;
+      esac
+    fi ;;
+esac
 
 FULL=0
 case "${1:-}" in
   state-read)  state_read; exit 0 ;;
   state-write) state_write "${2:-}"; exit 0 ;;
+  reap)        reap "${2:-}" "${3:-}"; exit 0 ;;
 esac
 
 for arg in "$@"; do
@@ -250,14 +485,40 @@ rd() { local v=""; [ -r "$1" ] && IFS= read -r v <"$1" 2>/dev/null; printf '%s' 
 # Everything passed to `jq --argjson` goes through this: a sensor that returns
 # "N/A", an empty sysfs read or a truncated file would otherwise abort jq and
 # take a whole section of the panel down with it.
+#
+# This and the two helpers below were an `awk` each. They are called around
+# forty times per sample, and a sample runs every 1.5-3 seconds forever: at that
+# rate the process spawns cost more than everything they were measuring. Bash
+# can answer all three questions itself, so it does.
 num() {
-  awk -v v="${1-}" -v d="${2-null}" 'BEGIN {
-    if (v ~ /^-?[0-9]+(\.[0-9]+)?$/) printf "%s", v; else printf "%s", d
-  }'
+  if [[ ${1-} =~ ^-?[0-9]+(\.[0-9]+)?$ ]]; then printf '%s' "$1"
+  else printf '%s' "${2-null}"; fi
+}
+
+# Round a number to a whole one in $ROUND, or "null" if it is not a number.
+# (printf rounds half to even, which is what awk's "%.0f" did too.)
+ROUND=null
+round() {
+  if [[ ${1-} =~ ^-?[0-9]+(\.[0-9]+)?$ ]]; then printf -v ROUND '%.0f' "$1"
+  else ROUND=${2-null}; fi
+}
+
+# Millidegrees (what hwmon files hold) to whole degrees, or "null".
+mdeg() {
+  if [[ ${1-} =~ ^-?[0-9]+$ ]]; then
+    if [ "$1" -ge 0 ]; then printf '%s' "$(( ($1 + 500) / 1000 ))"
+    else printf '%s' "$(( ($1 - 500) / 1000 ))"; fi
+  else printf 'null'; fi
 }
 
 # Collapse runs of whitespace and trim both ends.
-squish() { awk '{ $1 = $1; print }' <<<"$*"; }
+squish() {
+  local v="$*"
+  v=${v//[$' \t\n\r']/ }               # any whitespace is a space
+  while [[ $v == *"  "* ]]; do v=${v//  / }; done
+  v=${v# }; v=${v% }
+  printf '%s' "$v"
+}
 
 # Human-friendly GPU model name for a PCI address (e.g. 0000:06:00.0), via
 # lspci: "Cezanne [Radeon Vega Series / Radeon Mobile Series]" -> "Radeon Vega
@@ -278,7 +539,24 @@ gpu_model() {
 # Both need a delta across a short window, so take the two snapshots back to
 # back around one sleep.
 
-cpu_snap1=$(grep -E '^cpu[0-9]* ' /proc/stat)
+# The cpu lines come first in /proc/stat, so this stops as soon as they end.
+# `mapfile` rather than a `read` loop: bash's `read` asks the kernel for one
+# byte at a time so it can leave the descriptor exactly after the newline, which
+# on a 30 KB /proc file costs more than everything else in the sample put
+# together. mapfile takes the file in one pass.
+cpu_snap() {
+  local -a lines; local line
+  CPU_SNAP=
+  mapfile -t lines < /proc/stat
+  for line in "${lines[@]}"; do
+    case $line in
+      cpu\ *|cpu[0-9]*\ *) CPU_SNAP+=$line$'\n' ;;
+      *) break ;;
+    esac
+  done
+}
+
+cpu_snap; cpu_snap1=$CPU_SNAP
 
 declare -A NET_RX1 NET_TX1
 for dev in /sys/class/net/*; do
@@ -292,7 +570,7 @@ t1=${EPOCHREALTIME:-$(date +%s.%N)}
 
 sleep "$SAMPLE_INTERVAL"
 
-cpu_snap2=$(grep -E '^cpu[0-9]* ' /proc/stat)
+cpu_snap; cpu_snap2=$CPU_SNAP
 t2=${EPOCHREALTIME:-$(date +%s.%N)}
 dt=$(awk -v a="$t1" -v b="$t2" 'BEGIN { d = b - a; if (d <= 0) d = 0.35; print d }')
 
@@ -340,7 +618,10 @@ NET_JSON=$(jq -Rsc '
 
 # ---------------------------------------------------------------- load / freq
 read -r LOAD1 LOAD5 LOAD15 _ < /proc/loadavg
-NCPU=$(run nproc 2>/dev/null || echo 1)
+# NCPU is set from the topology pass over /proc/cpuinfo further down, which
+# counts the same threads `nproc` would have reported - so the number always
+# agrees with cpu_topology.threads and with the per-core array, and one more
+# external tool drops off the list.
 
 FREQ_MHZ=$(awk '
   { s += $1; n++ }
@@ -356,8 +637,15 @@ FREQ_MAX_MHZ=$(awk '
 # All of this is dumb file parsing that works on any Linux box - no hard-coded
 # device names, and every field falls back to null / a sane default.
 
-CPU_MODEL=$(awk -F': ' '/^model name/ { print $2; exit } /^Model name/ { print $2; exit }' /proc/cpuinfo)
-CPU_MODEL=$(sed -E 's/\((R|TM|tm|r)\)//g; s/ CPU @.*$//; s/[[:space:]]+/ /g; s/^ //; s/ $//' <<<"$CPU_MODEL")
+CPU_MODEL=$(awk -F': ' '
+  /^model name/ || /^Model name/ {
+    m = $2
+    gsub(/\((R|TM|tm|r)\)/, "", m)     # Intel(R) Core(TM) -> Intel Core
+    sub(/ CPU @.*$/, "", m)             # ... i7-9750H CPU @ 2.60GHz -> ... i7-9750H
+    gsub(/[ \t]+/, " ", m)
+    sub(/^ /, "", m); sub(/ $/, "", m)
+    print m; exit
+  }' /proc/cpuinfo)
 [ -z "$CPU_MODEL" ] && CPU_MODEL="$(uname -m) processor"
 
 # Physical cores / logical threads / sockets from /proc/cpuinfo topology. Falls
@@ -374,6 +662,8 @@ read -r CORES_PHYS THREADS SOCKETS < <(awk -F': ' '
     if (c == 0) c = (cc > 0 ? cc * s : th)
     print c, th, s
   }' /proc/cpuinfo)
+NCPU=$THREADS
+[ "${NCPU:-0}" -gt 0 ] 2>/dev/null || NCPU=1
 
 dmi() { rd "/sys/devices/virtual/dmi/id/$1"; }
 _sv=$(squish "$(dmi sys_vendor)"); _pf=$(squish "$(dmi product_family)")
@@ -393,7 +683,7 @@ case "$HOST_MODEL" in
   *)                                         HOST_MODEL="${_sv:+$_sv }$HOST_MODEL" ;;
 esac
 
-KERNEL=$(uname -r)
+IFS= read -r KERNEL < /proc/sys/kernel/osrelease 2>/dev/null || KERNEL=
 ARCH=$(uname -m)
 # /etc/os-release is shell syntax, but it is parsed rather than sourced: this
 # script never executes the contents of a file it only means to read.
@@ -408,60 +698,109 @@ DISTRO=$(awk -F= '
 [ -n "$DISTRO" ] || DISTRO="Linux"
 
 # ---------------------------------------------------------------- memory
-read -r MEM_TOTAL MEM_AVAIL SWAP_TOTAL SWAP_FREE < <(
+read -r MEM_PCT MEM_USED_GIB MEM_TOTAL_GIB SWAP_PCT SWAP_USED_GIB SWAP_TOTAL_GIB < <(
   awk '
     /^MemTotal:/     { mt = $2 }
     /^MemAvailable:/ { ma = $2 }
     /^SwapTotal:/    { st = $2 }
     /^SwapFree:/     { sf = $2 }
-    END { print mt + 0, ma + 0, st + 0, sf + 0 }
+    END {
+      used = mt - ma
+      printf "%.0f %.1f %.1f ", (mt > 0 ? 100 * used / mt : 0), used / 1048576, mt / 1048576
+      sused = st - sf
+      printf "%.0f %.1f %.1f\n", (st > 0 ? 100 * sused / st : 0), sused / 1048576, st / 1048576
+    }
   ' /proc/meminfo
-)
-read -r MEM_PCT MEM_USED_GIB MEM_TOTAL_GIB SWAP_PCT SWAP_USED_GIB SWAP_TOTAL_GIB < <(
-  awk -v mt="$MEM_TOTAL" -v ma="$MEM_AVAIL" -v st="$SWAP_TOTAL" -v sf="$SWAP_FREE" 'BEGIN {
-    used = mt - ma
-    printf "%.0f %.1f %.1f ", (mt > 0 ? 100 * used / mt : 0), used / 1048576, mt / 1048576
-    sused = st - sf
-    printf "%.0f %.1f %.1f\n", (st > 0 ? 100 * sused / st : 0), sused / 1048576, st / 1048576
-  }'
 )
 
 # ---------------------------------------------------------------- sensors
-SENSORS_JSON="{}"
-have sensors && SENSORS_JSON=$(run sensors -j 2>/dev/null | head -c "$MAX_SENSORS")
-[ -n "$SENSORS_JSON" ] || SENSORS_JSON="{}"
-# Guard against sensors emitting warnings that break JSON.
-jq -e . >/dev/null 2>&1 <<<"$SENSORS_JSON" || SENSORS_JSON="{}"
+# Temperatures and fans come straight from the kernel's hwmon interface, which
+# is where libsensors reads them from as well: one "<name>" per chip, and a
+# tempN_input / fanN_input in millidegrees or RPM beside an optional
+# tempN_label. Nothing here needs lm_sensors installed any more.
+#
+# It used to shell out to `sensors -j` once per sample. That cost 75-110 ms of
+# a sample that runs every 1.5-3 seconds - about half the work in the whole
+# sample, forever, on a laptop - and brought with it a 256 KB buffer, three jq
+# passes to dig values back out, and a chip name derived from a PCI address,
+# which is exactly the thing that silently broke GPU temperature on this
+# hardware once before. Reading the files costs about two milliseconds.
 
-# Pull the CPU/package temperature. Try AMD (k10temp: Tctl/Tdie/Tccd*), then
-# Intel (coretemp: "Package id *"), then fall back to the hottest generic
-# tempN_input on any chip and label it SYS.
-read -r CPU_TEMP CPU_TEMP_LABEL < <(
-  jq -r '
-    def inputs_of($obj): [ $obj | to_entries[] | select(.key|test("_input$")) | .value ];
-    ( [ to_entries[] | select(.key|test("k10temp"))    | .value
-        | to_entries[] | select(.key|test("Tdie|Tctl|Tccd"; "i")) | .value | inputs_of(.)[] ] ) as $amd
-    | ( [ to_entries[] | select(.key|test("coretemp")) | .value
-        | to_entries[] | select(.key|test("Package id"; "i")) | .value | inputs_of(.)[] ] ) as $intel
-    | if   ($amd   | length) > 0 then "\($amd   | max) CPU"
-      elif ($intel | length) > 0 then "\($intel | max) CPU"
-      else ( [ .. | objects | to_entries[] | select(.key|test("temp[0-9]+_input$")) | .value ]
-             | if length > 0 then "\(max) SYS" else "null SYS" end )
-      end
-  ' <<<"$SENSORS_JSON" 2>/dev/null
-)
-CPU_TEMP=$(awk -v v="$(num "${CPU_TEMP:-}")" 'BEGIN { if (v == "null") print "null"; else printf "%.0f", v }')
-[ -n "${CPU_TEMP_LABEL:-}" ] || CPU_TEMP_LABEL=SYS
+# Millidegrees, so the comparisons below are integer ones.
+TEMP_CPU=; TEMP_ANY=
+fan_rows=""
 
-FAN_JSON=$(jq -c '
-  [ .. | objects | to_entries[]
-    | select(.key|test("fan"; "i"))
-    | select(.value|type=="object")
-    | { name: .key,
-        rpm: ( [ .value | to_entries[] | select(.key|test("_input$")) | .value ] | (.[0] // 0) | floor ) }
-    | select(.rpm > 0) ]
-' <<<"$SENSORS_JSON" 2>/dev/null)
-[ -n "$FAN_JSON" ] || FAN_JSON="[]"
+hottest() {   # $1 = current max (may be empty), $2 = candidate; result in $HOT
+  HOT=$1
+  { [ -z "$HOT" ] || [ "$2" -gt "$HOT" ]; } && HOT=$2
+  return 0
+}
+
+temp_label_of() {   # $1 = a tempN_input path; result in $TLABEL
+  TLABEL=
+  [ -r "${1%_input}_label" ] && IFS= read -r TLABEL < "${1%_input}_label" 2>/dev/null
+  return 0
+}
+
+# Not every temperature costs the same to read. A sysfs file on a PCI device is
+# a register read; acpitz and the vendor WMI chips evaluate an ACPI method, and
+# those ran to tens of milliseconds per sample here. So ask the CPU's own driver
+# first, by name, and only fall back to reading every sensor on the machine when
+# this is a box where neither AMD's nor Intel's package sensor exists.
+for _h in /sys/class/hwmon/hwmon*; do
+  [ -r "$_h/name" ] || continue
+  IFS= read -r _hname < "$_h/name" 2>/dev/null || continue
+  case $_hname in k10temp|coretemp) ;; *) continue ;; esac
+  for _f in "$_h"/temp*_input; do
+    [ -r "$_f" ] || continue
+    temp_label_of "$_f"
+    case $_hname in
+      k10temp)  case $TLABEL in Tdie|Tctl|Tccd*) ;; *) continue ;; esac ;;
+      coretemp) case $TLABEL in "Package id"*)   ;; *) continue ;; esac ;;
+    esac
+    IFS= read -r _v < "$_f" 2>/dev/null || continue
+    [[ $_v =~ ^-?[0-9]+$ ]] || continue
+    hottest "$TEMP_CPU" "$_v"; TEMP_CPU=$HOT
+  done
+done
+
+if [ -n "$TEMP_CPU" ]; then
+  CPU_TEMP=$TEMP_CPU; CPU_TEMP_LABEL=CPU
+else
+  # No package sensor: report the hottest thing on the machine instead, which
+  # is what the old `sensors -j` pass did in this case too.
+  for _h in /sys/class/hwmon/hwmon*; do
+    for _f in "$_h"/temp*_input; do
+      [ -r "$_f" ] || continue
+      IFS= read -r _v < "$_f" 2>/dev/null || continue
+      [[ $_v =~ ^-?[0-9]+$ ]] || continue
+      hottest "$TEMP_ANY" "$_v"; TEMP_ANY=$HOT
+    done
+  done
+  CPU_TEMP=$TEMP_ANY; CPU_TEMP_LABEL=SYS
+fi
+CPU_TEMP=$(mdeg "$CPU_TEMP")
+
+# Fan speeds only appear in the detail panel, and on this machine they live on
+# the vendor's WMI chip - the expensive kind to read. Collect them with the rest
+# of the panel-only data.
+FAN_JSON="[]"
+if [ "$FULL" = "1" ]; then
+  for _h in /sys/class/hwmon/hwmon*; do
+    for _f in "$_h"/fan*_input; do
+      [ -r "$_f" ] || continue
+      IFS= read -r _v < "$_f" 2>/dev/null || continue
+      [[ $_v =~ ^[0-9]+$ ]] && [ "$_v" -gt 0 ] || continue   # a stopped fan is not news
+      temp_label_of "$_f"
+      [ -n "$TLABEL" ] || { TLABEL=${_f##*/}; TLABEL=${TLABEL%_input}; }
+      fan_rows+=$(squish "$TLABEL")$'\t'$_v$'\n'
+    done
+  done
+  FAN_JSON=$(jq -Rsc '
+    split("\n") | map(select(length > 0) | split("\t")
+    | { name: .[0], rpm: (.[1] | tonumber) })' <<<"$fan_rows" 2>/dev/null)
+  [ -n "$FAN_JSON" ] || FAN_JSON="[]"
+fi
 
 # ---------------------------------------------------------------- GPUs
 # Rows are "name<TAB>model<TAB>util<TAB>temp<TAB>mem_pct" and become JSON in a
@@ -474,34 +813,36 @@ for dev in /sys/class/drm/card*/device; do
   vendor=$(rd "$dev/vendor")
   busy=$(num "$(rd "$dev/gpu_busy_percent")" 0)
   name="GPU"
-  temp=null
+  temp_raw=
 
-  # libsensors names a PCI chip "<driver>-pci-<bbdf>" where bbdf = the 16-bit
-  # (bus << 8 | devfn) of the device's PCI address. Derive it so the right
-  # sensor block is picked on any machine (the address is not fixed).
-  pci=$(basename "$(readlink -f "$dev" 2>/dev/null)" 2>/dev/null)   # 0000:06:00.0
+  pci=$(readlink -f "$dev" 2>/dev/null); pci=${pci##*/}             # 0000:06:00.0
   model=$(gpu_model "$pci")
-  chip_suffix=""
-  if [[ $pci =~ ^[0-9a-fA-F]+:([0-9a-fA-F]{2}):([0-9a-fA-F]{2})\.([0-7])$ ]]; then
-    chip_suffix=$(printf 'pci-%04x' \
-      "$(( (16#${BASH_REMATCH[1]} << 8) | (16#${BASH_REMATCH[2]} << 3) | ${BASH_REMATCH[3]} ))")
-  fi
+
+  # The card's own hwmon, which is a directory inside the card's device node -
+  # so there is no chip name to derive and no way to attribute one card's
+  # temperature to another. (Deriving "<driver>-pci-<bbdf>" for libsensors is
+  # what used to break here when the address moved.) AMD labels the sensor
+  # edge / junction / mem; Intel's i915 and xe expose a single one.
+  for _f in "$dev"/hwmon/hwmon*/temp*_input "$dev"/hwmon*/temp*_input; do
+    [ -r "$_f" ] || continue
+    _lab=
+    [ -r "${_f%_input}_label" ] && IFS= read -r _lab < "${_f%_input}_label" 2>/dev/null
+    case ${_lab:-edge} in
+      edge|junction|GPU*|gpu*) ;;
+      *) [ -n "$temp_raw" ] && continue ;;     # keep looking for a better label
+    esac
+    IFS= read -r _v < "$_f" 2>/dev/null || continue
+    [[ $_v =~ ^-?[0-9]+$ ]] || continue
+    temp_raw=$_v
+    case ${_lab:-edge} in edge|junction|GPU*|gpu*) break ;; esac
+  done
 
   case "$vendor" in
-    0x1002) name="AMD"
-      temp=$(jq -r --arg chip "amdgpu-$chip_suffix" '
-        ( .[$chip] // ( [ to_entries[] | select(.key|test("^amdgpu")) | .value ] | .[0] ) // {} )
-        | [ to_entries[] | select(.key|test("edge|junction|GPU"; "i"))
-            | .value | to_entries[] | select(.key|test("_input$")) | .value ] | (.[0] // "null")' \
-                   <<<"$SENSORS_JSON" 2>/dev/null) ;;
-    0x8086) name="Intel"
-      temp=$(jq -r '
-        ( [ to_entries[] | select(.key|test("^i915|^xe|^intel")) | .value ] | .[0] // {} )
-        | [ to_entries[] | select(.key|test("_input$")) | .value ] | (.[0] // "null")' \
-                   <<<"$SENSORS_JSON" 2>/dev/null) ;;
+    0x1002) name="AMD" ;;
+    0x8086) name="Intel" ;;
     0x10de) name="NVIDIA" ;;
   esac
-  temp=$(awk -v v="$(num "${temp:-}")" 'BEGIN { if (v == "null") print "null"; else printf "%.0f", v }')
+  temp=$(mdeg "$temp_raw")
   gpu_rows+="$name	$model	$busy	$temp	null"$'\n'
 done
 
@@ -517,9 +858,10 @@ if [ "$FULL" = "1" ] && have nvidia-smi; then
     # (common on hybrid laptops); each field degrades to null on its own.
     nv_util=$(num "${nv_util:-}")
     nv_temp=$(num "${nv_temp:-}")
-    nv_mem_pct=$(awk -v u="$(num "${nv_mu:-}" -1)" -v t="$(num "${nv_mt:-}" -1)" 'BEGIN {
-      if (u < 0 || t <= 0) print "null"; else printf "%d", 100 * u / t
-    }')
+    nv_mem_pct=null
+    if [[ ${nv_mu:-} =~ ^[0-9]+$ && ${nv_mt:-} =~ ^[0-9]+$ ]] && [ "$nv_mt" -gt 0 ]; then
+      nv_mem_pct=$(( 100 * nv_mu / nv_mt ))
+    fi
     gpu_rows+="NVIDIA	$nv_name	$nv_util	$nv_temp	$nv_mem_pct"$'\n'
   fi
 fi
@@ -589,7 +931,11 @@ if [ "$FULL" = "1" ]; then
     dtemp=null
     for h in "$blk"/device/hwmon*/temp1_input "$blk"/device/hwmon/hwmon*/temp1_input; do
       [ -r "$h" ] || continue
-      dtemp=$(awk -v v="$(num "$(rd "$h")")" 'BEGIN { if (v == "null") print "null"; else printf "%.0f", v / 1000 }')
+      IFS= read -r _mdeg <"$h" 2>/dev/null || _mdeg=
+      if [[ $_mdeg =~ ^-?[0-9]+$ ]]; then            # millidegrees, always whole
+        if [ "$_mdeg" -ge 0 ]; then dtemp=$(( (_mdeg + 500) / 1000 ))
+        else dtemp=$(( (_mdeg - 500) / 1000 )); fi
+      fi
       break
     done
 
@@ -616,12 +962,13 @@ for bat in /sys/class/power_supply/BAT*; do
 done
 
 # ---------------------------------------------------------------- uptime
-UPTIME_STR=$(awk '{ s = int($1)
-  d = int(s/86400); h = int((s%86400)/3600); m = int((s%3600)/60)
-  if (d > 0) printf "%dd %dh", d, h
-  else if (h > 0) printf "%dh %dm", h, m
-  else printf "%dm", m
-}' /proc/uptime)
+IFS='. ' read -r _up _ < /proc/uptime 2>/dev/null || _up=0
+[[ $_up =~ ^[0-9]+$ ]] || _up=0
+_d=$(( _up / 86400 )); _h=$(( (_up % 86400) / 3600 )); _m=$(( (_up % 3600) / 60 ))
+if   [ "$_d" -gt 0 ]; then printf -v UPTIME_STR '%dd %dh' "$_d" "$_h"
+elif [ "$_h" -gt 0 ]; then printf -v UPTIME_STR '%dh %dm' "$_h" "$_m"
+else                       printf -v UPTIME_STR '%dm' "$_m"
+fi
 
 # ---------------------------------------------------------------- top processes
 # A process name is attacker-influenced text: any user can run a binary called

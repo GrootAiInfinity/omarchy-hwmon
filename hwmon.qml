@@ -70,7 +70,6 @@ Panel {
   // here, and all of them mean the numbers on screen are no longer current.
   property double lastSampleMs: 0
   property bool stalled: false
-  property int killPid: 0
   readonly property bool degraded: statsError !== "" || stalled
   readonly property int staleAfterMs: 12000
 
@@ -130,15 +129,13 @@ Panel {
   }
 
   function refresh() {
-    // One sample at a time. The watchdog below makes sure a wedged backend
-    // (a hung nvidia-smi, an unresponsive sensor) releases the slot instead of
-    // freezing the readout for the rest of the session.
-    if (statsProc.running) return
-    statsProc.command = root.launch(root.opened
+    // One sample at a time. The deadline on the runner below makes sure a
+    // wedged backend (a hung nvidia-smi, an unresponsive sensor) releases the
+    // slot instead of freezing the readout for the rest of the session.
+    if (statsRun.running) return
+    statsRun.start(root.opened
       ? [root.script, "stats", "--full"]
       : [root.script, "stats"])
-    statsProc.running = true
-    sampleWatchdog.restart()
   }
 
   function parseStats(text) {
@@ -165,13 +162,12 @@ Panel {
     if (root.expanded === v) return
     root.expanded = v
     root.stateResolved = true
-    if (stateWriteProc.running) { root.pendingState = v; return }
+    if (stateWrite.running) { root.pendingState = v; return }
     root.writeState(v)
   }
 
   function writeState(v) {
-    stateWriteProc.command = root.launch([root.script, "state-write", v ? "1" : "0"])
-    stateWriteProc.running = true
+    stateWrite.start([root.script, "state-write", v ? "1" : "0"])
   }
 
   function applyState(raw) {
@@ -209,8 +205,7 @@ Panel {
 
   Component.onCompleted: {
     lastSampleMs = Date.now()
-    stateReadProc.command = root.launch([root.script, "state-read"])
-    stateReadProc.running = true
+    stateRead.start([root.script, "state-read"])
     refresh()
   }
 
@@ -227,68 +222,117 @@ Panel {
     }
   }
 
-  Timer {
-    id: sampleWatchdog
-    interval: 10000
-    repeat: false
-    onTriggered: {
-      // Free the slot so the next tick can sample again; the poll timer above
-      // decides when that counts as stale.
-      if (!statsProc.running) return
-      root.killPid = Number(statsProc.processId) || 0
-      statsProc.running = false        // asks politely (SIGTERM)
-      hardKillTimer.restart()          // and follows up if it is ignored
+  // ------------------------------------------------------------------ backend
+  // One backend invocation with a deadline, and an escalation that takes
+  // nothing here on trust.
+  //
+  // Quickshell's Process.running means "there is a process object", not "the
+  // program is still there": setting it false sends SIGTERM and the property
+  // stays true until the child actually exits. Neither reading is a safe basis
+  // for killing something, so the escalation is keyed on the pid the deadline
+  // recorded and runs whatever this side believes - including after the child
+  // has exited, because a child exiting says nothing about the helpers
+  // underneath it, which can still be running and holding the pipe.
+  //
+  // What it does about that pid is hwmon.sh's decision, not this file's:
+  // `reap` re-derives group, session, age and command line from /proc, refuses
+  // anything that is not still one of ours, and does nothing at all when the
+  // group is already empty.
+  component Guarded: QtObject {
+    id: g
+    signal finished(string text)
+
+    property int deadlineMs: 10000
+    property int watchedPid: 0
+    readonly property bool running: proc.running
+
+    function start(argv) {
+      if (proc.running) return false
+      proc.command = root.launch(argv)
+      proc.running = true
+      watchdog.restart()
+      return true
+    }
+
+    property Process proc: Process {
+      // Only the deadline is cancelled here. The escalation stays armed on
+      // purpose - see above.
+      onExited: watchdog.stop()
+      stdout: StdioCollector {
+        waitForEnd: true
+        onStreamFinished: g.finished(text)
+      }
+    }
+
+    property Timer watchdog: Timer {
+      interval: g.deadlineMs
+      repeat: false
+      onTriggered: {
+        if (!g.proc.running) return
+        g.watchedPid = Number(g.proc.processId) || 0
+        g.proc.running = false          // SIGTERM, which is only a request
+        if (g.watchedPid) escalation.restart()
+      }
+    }
+
+    property Timer escalation: Timer {
+      interval: 3000
+      repeat: false
+      onTriggered: {
+        var pid = g.watchedPid
+        g.watchedPid = 0
+        if (pid) root.reap(pid, Math.ceil(g.deadlineMs / 1000))
+      }
     }
   }
 
-  Process {
-    id: statsProc
-    onExited: { sampleWatchdog.stop(); hardKillTimer.stop(); root.killPid = 0 }
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: root.parseStats(text)
-    }
+  // The deadline doubles as the minimum age the reaper will accept for that
+  // pid: anything younger cannot be the process this one was waiting on, so a
+  // recycled number is refused instead of killed.
+  Guarded {
+    id: statsRun
+    deadlineMs: 10000
+    onFinished: function (text) { root.parseStats(text) }
   }
 
-  // SIGTERM is a request. A process blocked in an uninterruptible driver call -
-  // the reason a hardware sample hangs in the first place - can sit through it,
-  // so escalate rather than leave it holding memory and a process slot.
-  Timer {
-    id: hardKillTimer
-    interval: 3000
-    repeat: false
-    onTriggered: {
-      if (!statsProc.running || !root.killPid) return
-      // Kill the whole process group, so a stuck nvidia-smi under the script
-      // goes too - but only once ps confirms the pid really is that group's
-      // leader. setsid makes it one; if that ever failed, a group kill would
-      // hit the shell's own group, so fall back to the single pid instead.
-      killProc.command = root.launch(["/bin/sh", "-c",
-        'pgid=$(/usr/bin/ps -o pgid= -p "$1" 2>/dev/null | tr -d " ")\n' +
-        'if [ -n "$pgid" ] && [ "$pgid" = "$1" ]; then kill -9 -- "-$pgid"; else kill -9 -- "$1"; fi',
-        "sh", String(root.killPid)])
-      killProc.running = true
-    }
+  // The state helpers have ceilings of their own inside hwmon.sh (eight seconds
+  // for the whole operation, two for the one open that can block). This is the
+  // outer bound for the case where even that does not come back.
+  Guarded {
+    id: stateRead
+    deadlineMs: 12000
+    onFinished: function (text) { root.applyState(text) }
   }
 
-  Process { id: killProc }
-
-  Process {
-    id: stateReadProc
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: root.applyState(text)
-    }
-  }
-
-  Process {
-    id: stateWriteProc
-    onExited: {
+  Guarded {
+    id: stateWrite
+    deadlineMs: 12000
+    onFinished: function (text) {
       if (root.pendingState === null) return
       var v = root.pendingState
       root.pendingState = null
       if (v !== root.expanded) return
       root.writeState(v)
+    }
+  }
+
+  // Reaps are rare and run one at a time. A second request arriving while one
+  // is in flight is queued rather than dropped: by definition it names a
+  // process that did not go away on its own.
+  property var reapQueue: []
+
+  function reap(pid, minAgeSec) {
+    if (reapProc.running) { root.reapQueue.push([pid, minAgeSec]); return }
+    reapProc.command = root.launch([root.script, "reap", String(pid), String(minAgeSec)])
+    reapProc.running = true
+  }
+
+  Process {
+    id: reapProc
+    onExited: {
+      if (root.reapQueue.length === 0) return
+      var next = root.reapQueue.shift()
+      Qt.callLater(function () { root.reap(next[0], next[1]) })
     }
   }
 
