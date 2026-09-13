@@ -4,6 +4,19 @@ All notable changes to this plugin are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.1] — 2026-09-13
+
+### Changed
+
+- **The Intel GPU scan is capped like every other producer in the backend.** The
+  fdinfo snapshots grow one short row per DRM client and engine, and any local
+  process can open more descriptors; the rest of this file caps what it reads at
+  the point it reads it, and this path did not. The client list is now limited to
+  512 descriptors per sample and the snapshot to 256 KiB, and the reader drops a
+  row that a cap cut in half rather than reading a missing field as a zero
+  counter. Not a vulnerability — a sample is already time-limited and torn down
+  by the watchdog — but it is the discipline the rest of the file keeps.
+
 ## [1.5.0] — 2026-09-13
 
 Intel GPU utilisation and fan duty cycle, contributed by

@@ -44,6 +44,8 @@ SAMPLE_INTERVAL=0.35
 # on the other end buffers whatever arrives with no limit of its own, so a
 # runaway or hostile helper would otherwise grow the shell's heap unbounded.
 MAX_SMI=4096              # four short CSV fields
+MAX_DRM=262144            # the fdinfo snapshot: thousands of clients' worth
+MAX_DRM_CLIENTS=512       # DRM client descriptors read per sample
 MAX_LSPCI=65536           # one device line
 MAX_DF=65536              # one line per mount
 MAX_PS=16384              # five lines, twice
@@ -290,8 +292,13 @@ drm_clients() {
   # open descriptor on the machine, which on a busy desktop is tens of thousands
   # of arguments and would fail the exec outright. find batches them under the
   # limit; the starting points are one per process, which is small.
+  # Capped like every other producer in this file: the list is one entry per
+  # open DRM descriptor, and any local process can open more of them. A machine
+  # with five hundred is already extreme, and reading past that would cost time
+  # and memory to tell us nothing new.
   find /proc/[0-9]*/fdinfo -maxdepth 1 -type f \
-    -exec grep -lE '^drm-driver:[[:space:]]*(xe|i915)$' {} + 2>/dev/null
+    -exec grep -lE '^drm-driver:[[:space:]]*(xe|i915)$' {} + 2>/dev/null \
+    | head -n "$MAX_DRM_CLIENTS"
 }
 
 drm_snapshot() {   # $@ = fdinfo files
@@ -302,7 +309,7 @@ drm_snapshot() {   # $@ = fdinfo files
     /^drm-cycles-/       { e = $1; sub(/^drm-cycles-/, "", e); cyc[pdev SUBSEP cid SUBSEP e] = $2 }
     /^drm-total-cycles-/ { e = $1; sub(/^drm-total-cycles-/, "", e); tot[pdev SUBSEP cid SUBSEP e] = $2 }
     END { for (k in cyc) { split(k, a, SUBSEP); print a[1] "\t" a[2] "\t" a[3] "\t" cyc[k] "\t" tot[k] } }
-  ' "$@" 2>/dev/null
+  ' "$@" 2>/dev/null | head -c "$MAX_DRM"
 }
 
 # Busiest engine of one card, as a whole percentage, from the two snapshots in
@@ -310,8 +317,10 @@ drm_snapshot() {   # $@ = fdinfo files
 # the engine's own tick delta. "null" when neither snapshot held the card.
 drm_busy() {   # $1 = pci address
   awk -F'\t' -v pdev="$1" '
-    NR == FNR { if ($1 == pdev) { c[$2 SUBSEP $3] = $4; t[$2 SUBSEP $3] = $5 } next }
-    { if ($1 != pdev) next
+    # NF == 5 drops a row the byte cap cut in half rather than reading an empty
+    # field as a zero counter.
+    NR == FNR { if (NF == 5 && $1 == pdev) { c[$2 SUBSEP $3] = $4; t[$2 SUBSEP $3] = $5 } next }
+    { if (NF != 5 || $1 != pdev) next
       k = $2 SUBSEP $3; if (!(k in c)) next
       dc = $4 - c[k]; dt = $5 - t[k]
       if (dt > 0) { busy[$3] += dc; total[$3] = dt } }
