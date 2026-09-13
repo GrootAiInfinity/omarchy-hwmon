@@ -4,6 +4,56 @@ All notable changes to this plugin are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.0] — 2026-09-13
+
+Intel GPU utilisation and fan duty cycle, contributed by
+[@baylander](https://github.com/baylander), and a core/thread switch for the
+CPU grid.
+
+### Added
+
+- **Intel GPU utilisation** (thanks [@baylander](https://github.com/baylander),
+  [#1](https://github.com/GrootAiInfinity/omarchy-hwmon/pull/1)). The `xe` and
+  `i915` drivers expose no `gpu_busy_percent`, so an Intel iGPU showed no
+  utilisation at all. The DRM clients' cycle counters in `/proc/<pid>/fdinfo`
+  are snapshotted across the same window the CPU and network deltas already
+  use, and the busiest engine is reported as a percentage, keyed by
+  `(pdev, client-id, engine)` so a client holding several render fds is not
+  counted twice. AMD keeps using `gpu_busy_percent`; NVIDIA keeps using
+  `nvidia-smi`; machines with neither pay nothing, because the scan only runs
+  when such a card is present.
+- **Fan duty cycle** (same contribution). A stopped fan is kept — 0 rpm says
+  the fan is off rather than absent — one physical fan exposed through two
+  chips is listed once, and the kernel's 0-255 `pwmN` is folded into a
+  percentage shown beside the rpm.
+- **The CPU grid switches between cores and threads**, cores by default. On an
+  SMT machine the thread view is twice the blocks for the same silicon, which
+  is more noise than signal unless you are chasing one hot thread. The choice is
+  the `cpuView` setting, saved like the bar readout's, and switched from the
+  panel with the Cores / Threads buttons above the grid. `stats` gained
+  `cpu_core_of`, which says which physical core each thread sits on.
+
+### Changed
+
+- **The grid blocks are a third of the height and finally carry their number.**
+  They were unlabelled vertical bars at `Style.space(40)`; each is now a
+  horizontal fill at `Style.space(17)` with the core or thread number on the
+  left and its load on the right. With cores as the default, the whole section
+  takes well under half the space it did.
+- Tidied up on the way in: the fdinfo scan uses `find … -exec +` rather than a
+  bare `/proc/*/fdinfo/*` glob, which on a busy machine is tens of thousands of
+  arguments and would fail the exec outright; the card's driver is resolved
+  without two forks per card per sample; and a fan's label is carried beside its
+  key rather than unpacked back out of it, since a label may contain any
+  character.
+
+### Tests
+
+- The core map is checked for one entry per thread, whole numbers, as many
+  distinct cores as the topology reports, and numbering from 0 with no gaps.
+- Fan duty cycle is checked to be absent or a percentage, and rpm to be a whole
+  number.
+
 ## [1.4.1] — 2026-09-12
 
 Fixes a miscount introduced in 1.3.0: the per-core grid showed one core too many.

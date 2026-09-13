@@ -8,7 +8,7 @@
 set -u
 cd "$(dirname "$0")"
 failed=0
-for check in test-repo.sh test-backend.sh test-reaper.sh test-widget.sh; do
+for check in test-repo.sh test-backend.sh test-cpuview.sh test-reaper.sh test-widget.sh; do
   ./"$check" || failed=$((failed + 1))
   echo
 done

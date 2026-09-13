@@ -26,6 +26,20 @@ is "and with the reported topology"  "$(jq -r .cpu_topology.threads <<<"$out")" 
 is "every core reads as a percentage" \
    "$(jq -r '.cpu_cores|map(type=="number" and . >= 0 and . <= 100)|all' <<<"$out")" true
 
+# The grid can fold threads into cores, which needs a map the same length as
+# the thread list, numbered 0..cores-1 with one entry per thread.
+map_len=$(jq -r '.cpu_core_of|length' <<<"$out")
+if [ "$map_len" = 0 ]; then
+  printf '  skip core map (this machine exposes no cpu topology)\n'
+else
+  is "the core map has one entry per thread" "$map_len" "$threads"
+  is "its entries are whole numbers"  "$(jq -r '.cpu_core_of|map(type=="number" and . == floor and . >= 0)|all' <<<"$out")" true
+  is "it names as many cores as the topology does" \
+     "$(jq -r '.cpu_core_of|unique|length' <<<"$out")" "$(jq -r .cpu_topology.cores <<<"$out")"
+  is "core numbering starts at 0 with no gaps" \
+     "$(jq -r '(.cpu_core_of|unique) == [range(.cpu_topology.cores)]' <<<"$out")" true
+fi
+
 full=$("$HWMON" stats --full)
 is "--full is valid JSON"         "$(jq -e . >/dev/null 2>&1 <<<"$full"; echo $?)" 0
 is "--full says so"               "$(jq -r .full <<<"$full")" true
@@ -63,6 +77,11 @@ hostile=$("$HWMON" stats --full)
 is "a hostile process name cannot break the JSON" "$(jq -e . >/dev/null 2>&1 <<<"$hostile"; echo $?)" 0
 is "and is carried as one string"  "$(jq -r '[.top_cpu[],.top_mem[]]|map(.name)|all(type=="string")' <<<"$hostile")" true
 kill "$HOSTILE" 2>/dev/null
+
+is "fan duty cycle is a percentage or absent" \
+   "$(jq -r '.fans|map(.pwm == null or (type=="object" and (.pwm >= 0 and .pwm <= 100)))|all' <<<"$full")" true
+is "every fan reports whole rpm" \
+   "$(jq -r '.fans|map(.rpm|type=="number" and . == floor and . >= 0)|all' <<<"$full")" true
 
 is "an unknown argument is refused"  "$("$HWMON" bogus >/dev/null 2>&1; echo $?)" 2
 is "--help works"                    "$("$HWMON" --help >/dev/null 2>&1; echo $?)" 0

@@ -24,7 +24,8 @@ about the plugin. The full list of what the panel shows is below.
 - **Left-click** opens the detail panel:
   - System summary: machine model, CPU model, core / thread / socket count,
     distro, kernel, architecture
-  - CPU usage, current / max frequency, load average, and a per-core bar grid
+  - CPU usage, current / max frequency, load average, and a numbered grid of
+    per-core blocks — switchable to one block per thread, cores by default
   - Memory and swap
   - Thermals and fan speeds (a stopped fan included, with its PWM duty cycle
     where the chip exposes one)
@@ -88,16 +89,21 @@ delete.)
 
 ## Configuration
 
-One setting, `expanded`, exposed in the manifest and settable per bar entry in
+Two settings, exposed in the manifest and settable per bar entry in
 `~/.config/omarchy/shell.json`:
 
 ```json
-{ "id": "io.github.grootaiinfinity.hwmon", "expanded": true }
+{ "id": "io.github.grootaiinfinity.hwmon", "expanded": true, "cpuView": "cores" }
 ```
 
-Toggling the readout at runtime (right-click or scroll) changes this same
-value: the shell writes it back to that entry, the way it does for its own
-tray and clock widgets. There is no second place the preference lives.
+`expanded` is the bar readout; `cpuView` is `cores` or `threads` and decides
+whether the grid under the CPU meter shows one block per physical core or one
+per thread. Both are also switched from the widget itself — the readout by
+right-click or scroll, the grid by the Cores / Threads buttons above it.
+
+Changing either at runtime writes it back to that same entry: the shell does
+the write, the way it does for its own tray and clock widgets. There is no
+second place these preferences live.
 
 ### Scripting
 

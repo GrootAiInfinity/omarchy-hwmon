@@ -58,6 +58,41 @@ Panel {
   property var shell: null
   readonly property var shellApi: root.shell || (root.bar ? root.bar.shell : null)
 
+  // Cores or threads in the grid below the CPU meter. Cores by default: on an
+  // SMT machine the thread view is twice the blocks for the same silicon, which
+  // is more noise than signal unless you are chasing one hot thread. Saved with
+  // the rest of this widget's settings, so the choice survives a restart.
+  readonly property string cpuView: root.setting("cpuView", "cores") === "threads" ? "threads" : "cores"
+
+  function setCpuView(v) {
+    if (v !== "cores" && v !== "threads" || root.cpuView === v) return
+    root.save("cpuView", v)
+  }
+
+  // [{ label, pct }] for the grid. Threads come straight from the backend;
+  // cores average the threads the kernel says sit on each one. Without a
+  // topology map (some VMs, some ARM) there is nothing to fold, so the thread
+  // view is all there is.
+  readonly property var cpuCells: {
+    var t = root.stats.cpu_cores || []
+    var threads = t.map(function (v, i) { return { label: String(i), pct: Number(v) || 0 } })
+    if (t.length === 0 || root.cpuView === "threads") return threads
+
+    var map = root.stats.cpu_core_of || []
+    if (map.length !== t.length) return threads
+
+    var sum = {}, n = {}
+    for (var i = 0; i < t.length; i++) {
+      var c = Number(map[i])
+      sum[c] = (sum[c] || 0) + (Number(t[i]) || 0)
+      n[c] = (n[c] || 0) + 1
+    }
+    var out = []
+    for (var k in sum) out.push({ key: Number(k), label: String(k), pct: sum[k] / n[k] })
+    out.sort(function (a, b) { return a.key - b.key })
+    return out
+  }
+
   readonly property int cpuPct: Math.round(Number(stats.cpu_pct) || 0)
   readonly property int memPct: Math.round(Number(stats.mem_pct) || 0)
   readonly property var tempC: (stats.temp_c === null || stats.temp_c === undefined) ? null : Math.round(stats.temp_c)
@@ -519,18 +554,61 @@ Panel {
           }
           Meter { width: parent.width; value: root.cpuPct }
 
-          Grid {
+          Item {
             width: parent.width
-            visible: (root.stats.cpu_cores || []).length > 0
-            columns: 8
-            columnSpacing: Style.space(4)
-            rowSpacing: Style.space(4)
-            Repeater {
-              model: root.stats.cpu_cores || []
-              CoreBar {
-                required property var modelData
-                pct: Number(modelData) || 0
-                cellW: (panelColumn.width - Style.space(4) * 7) / 8
+            visible: root.cpuCells.length > 0
+            implicitHeight: cpuGrid.y + cpuGrid.implicitHeight
+
+            Row {
+              id: cpuViewToggle
+              anchors.right: parent.right
+              spacing: Style.space(3)
+              Repeater {
+                model: [{ key: "cores", label: "Cores" }, { key: "threads", label: "Threads" }]
+                Rectangle {
+                  id: seg
+                  required property var modelData
+                  readonly property bool current: root.cpuView === seg.modelData.key
+                  width: segLabel.implicitWidth + Style.space(10)
+                  height: Style.space(15)
+                  radius: height / 2
+                  color: seg.current ? Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.25)
+                                     : Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.10)
+                  Text {
+                    id: segLabel
+                    anchors.centerIn: parent
+                    textFormat: Text.PlainText
+                    text: seg.modelData.label
+                    color: root.fg
+                    opacity: seg.current ? 1 : 0.55
+                    font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                    font.pixelSize: Style.font.caption
+                  }
+                  MouseArea {
+                    anchors.fill: parent
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: root.setCpuView(seg.modelData.key)
+                  }
+                }
+              }
+            }
+
+            Grid {
+              id: cpuGrid
+              anchors.top: cpuViewToggle.bottom
+              anchors.topMargin: Style.space(5)
+              width: parent.width
+              columns: 4
+              columnSpacing: Style.space(4)
+              rowSpacing: Style.space(4)
+              Repeater {
+                model: root.cpuCells
+                CoreCell {
+                  required property var modelData
+                  label: modelData.label
+                  pct: modelData.pct
+                  cellW: (cpuGrid.width - Style.space(4) * 3) / 4
+                }
               }
             }
           }
@@ -897,31 +975,58 @@ Panel {
     }
   }
 
-  component CoreBar: Item {
-    id: coreBar
+  // One block of the CPU grid: a horizontal fill with the core (or thread)
+  // number on the left and its load on the right. It used to be a vertical bar
+  // with no label at all - this is the same reading in well under half the
+  // height, and there is finally room to say which core you are looking at.
+  component CoreCell: Item {
+    id: cell
+    property string label: ""
     property real pct: 0
     property real cellW: 10
     readonly property real clamped: Math.max(0, Math.min(100, pct))
     width: cellW
-    height: Style.space(40)
-    implicitHeight: Style.space(40)
+    height: Style.space(17)
+    implicitHeight: Style.space(17)
 
     Rectangle {
-      id: coreTrack
+      id: cellTrack
       anchors.fill: parent
-      radius: Style.space(2)
+      radius: Style.space(3)
       color: Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.13)
+      clip: true
+
+      Rectangle {
+        anchors.left: parent.left
+        anchors.top: parent.top
+        anchors.bottom: parent.bottom
+        width: Math.max(cell.clamped > 0 ? 1 : 0, parent.width * cell.clamped / 100)
+        radius: parent.radius
+        opacity: 0.85
+        color: root.meterColor(cell.clamped, 78, 92)
+        Behavior on width { NumberAnimation { duration: 220; easing.type: Easing.OutCubic } }
+      }
     }
-    Rectangle {
-      anchors.left: coreTrack.left
-      anchors.right: coreTrack.right
-      anchors.bottom: coreTrack.bottom
-      radius: Style.space(2)
-      height: Math.max(coreBar.clamped > 0 ? 1 : 0, coreTrack.height * coreBar.clamped / 100)
-      color: coreBar.clamped >= 92 ? Color.urgent
-           : coreBar.clamped >= 78 ? Qt.tint(Color.accent, Qt.rgba(Color.urgent.r, Color.urgent.g, Color.urgent.b, 0.45))
-           : Color.accent
-      Behavior on height { NumberAnimation { duration: 220; easing.type: Easing.OutCubic } }
+    Text {
+      anchors.left: cellTrack.left
+      anchors.leftMargin: Style.space(5)
+      anchors.verticalCenter: cellTrack.verticalCenter
+      textFormat: Text.PlainText
+      text: cell.label
+      color: root.fg
+      opacity: 0.7
+      font.family: root.bar ? root.bar.fontFamily : Style.font.family
+      font.pixelSize: Style.font.caption
+    }
+    Text {
+      anchors.right: cellTrack.right
+      anchors.rightMargin: Style.space(5)
+      anchors.verticalCenter: cellTrack.verticalCenter
+      textFormat: Text.PlainText
+      text: Math.round(cell.pct) + "%"
+      color: root.fg
+      font.family: root.bar ? root.bar.fontFamily : Style.font.family
+      font.pixelSize: Style.font.caption
     }
   }
 

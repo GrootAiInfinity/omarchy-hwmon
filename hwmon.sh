@@ -286,7 +286,12 @@ gpu_model() {
 # The clients are found once per sample and both snapshots read the same file
 # list, so opening every fdinfo on the machine is paid once rather than twice.
 drm_clients() {
-  grep -lE '^drm-driver:[[:space:]]*(xe|i915)$' /proc/[0-9]*/fdinfo/[0-9]* 2>/dev/null
+  # `find ... -exec +` rather than a bare glob: /proc/*/fdinfo/* is one path per
+  # open descriptor on the machine, which on a busy desktop is tens of thousands
+  # of arguments and would fail the exec outright. find batches them under the
+  # limit; the starting points are one per process, which is small.
+  find /proc/[0-9]*/fdinfo -maxdepth 1 -type f \
+    -exec grep -lE '^drm-driver:[[:space:]]*(xe|i915)$' {} + 2>/dev/null
 }
 
 drm_snapshot() {   # $@ = fdinfo files
@@ -357,12 +362,17 @@ t1=${EPOCHREALTIME:-$(date +%s.%N)}
 # (Intel's xe/i915) are snapshotted across the same window as the CPU and
 # network deltas, so they cost no extra sleep. DRM_CARDS holds their PCI
 # addresses; DRM1 / DRM2 are the before/after readings.
+drm_driver_of() {   # $1 = a card's device directory; result in $DRM_DRIVER
+  DRM_DRIVER=$(readlink -f "$1/driver" 2>/dev/null)
+  DRM_DRIVER=${DRM_DRIVER##*/}
+  return 0
+}
+
 DRM_CARDS=()
 for dev in /sys/class/drm/card*/device; do
   [ -r "$dev/gpu_busy_percent" ] && continue
-  drv=$(basename "$(readlink -f "$dev/driver" 2>/dev/null)" 2>/dev/null)
-  case $drv in xe|i915) ;; *) continue ;; esac
-  DRM_CARDS+=("$(readlink -f "$dev" 2>/dev/null)")
+  drm_driver_of "$dev"
+  case $DRM_DRIVER in xe|i915) DRM_CARDS+=("$dev") ;; esac
 done
 DRM_FILES=()
 DRM1=; DRM2=
@@ -404,6 +414,33 @@ read -r CPU_PCT CPU_CORES_JSON < <(
     }'
 )
 jq -e . >/dev/null 2>&1 <<<"${CPU_CORES_JSON:-}" || CPU_CORES_JSON="[]"
+
+# Which physical core each entry of cpu_cores sits on, so the panel can fold an
+# SMT machine's threads back into cores. The thread order is taken from the same
+# /proc/stat snapshot the percentages came from, because an offline cpu leaves a
+# gap in the numbering and the two lists have to line up. Cores are renumbered
+# in the order they first appear, so the labels read 0..n-1 whatever ids the
+# kernel uses. Empty when the machine exposes no topology (some VMs, some ARM),
+# and the panel falls back to showing threads.
+CORE_OF_JSON="[]"
+_core_of=""
+declare -A _core_seen=()
+_core_next=0
+while IFS= read -r _line; do
+  case $_line in cpu[0-9]*\ *) ;; *) continue ;; esac
+  _n=${_line%% *}; _n=${_n#cpu}
+  _topo=/sys/devices/system/cpu/cpu$_n/topology
+  IFS= read -r _cid < "$_topo/core_id" 2>/dev/null || { _core_of=; break; }
+  IFS= read -r _pkg < "$_topo/physical_package_id" 2>/dev/null || _pkg=0
+  [[ $_cid =~ ^[0-9]+$ ]] || { _core_of=; break; }
+  _key=$_pkg:$_cid
+  if [ -z "${_core_seen[$_key]+x}" ]; then
+    _core_seen[$_key]=$_core_next; _core_next=$((_core_next + 1))
+  fi
+  _core_of+="${_core_of:+,}${_core_seen[$_key]}"
+done <<<"$cpu_snap2"
+[ -n "$_core_of" ] && CORE_OF_JSON="[$_core_of]"
+jq -e . >/dev/null 2>&1 <<<"$CORE_OF_JSON" || CORE_OF_JSON="[]"
 
 # One jq for the whole interface list rather than one per interface. Interface
 # names cannot contain whitespace, so a tab-separated line is unambiguous.
@@ -597,6 +634,7 @@ CPU_TEMP=$(mdeg "$CPU_TEMP")
 # kernel reports pwm as 0-255, folded into a percentage.
 FAN_JSON="[]"
 if [ "$FULL" = "1" ]; then
+  declare -A fan_name=()
   declare -A fan_rpm=()
   declare -A fan_pwm=()
   fan_order=()
@@ -617,16 +655,20 @@ if [ "$FULL" = "1" ]; then
         [[ $_raw =~ ^[0-9]+$ ]] && _pwm=$(( (_raw * 100 + 127) / 255 ))
       fi
 
-      _key=$_name/$_v
+      # Keyed on name and rpm together, with the name kept beside it rather
+      # than unpacked out of the key again - a label is free to contain any
+      # character, including whatever separator the key uses.
+      _key=$_name$'\x1f'$_v
       if [ -z "${fan_rpm[$_key]+x}" ]; then
-        fan_order+=("$_key"); fan_rpm[$_key]=$_v; fan_pwm[$_key]=$_pwm
+        fan_order+=("$_key"); fan_name[$_key]=$_name
+        fan_rpm[$_key]=$_v; fan_pwm[$_key]=$_pwm
       elif [ "$_pwm" != null ] && [ "${fan_pwm[$_key]}" = null ]; then
         fan_pwm[$_key]=$_pwm
       fi
     done
   done
   for _key in "${fan_order[@]}"; do
-    fan_rows+="${_key%/*}	${fan_rpm[$_key]}	${fan_pwm[$_key]}"$'\n'
+    fan_rows+="${fan_name[$_key]}	${fan_rpm[$_key]}	${fan_pwm[$_key]}"$'\n'
   done
   FAN_JSON=$(jq -Rsc '
     split("\n") | map(select(length > 0) | split("\t")
@@ -650,8 +692,8 @@ for dev in /sys/class/drm/card*/device; do
   if [ -r "$dev/gpu_busy_percent" ]; then
     busy=$(num "$(rd "$dev/gpu_busy_percent")" 0)
   else
-    drv=$(basename "$(readlink -f "$dev/driver" 2>/dev/null)" 2>/dev/null)
-    case $drv in xe|i915) ;; *) continue ;; esac
+    drm_driver_of "$dev"
+    case $DRM_DRIVER in xe|i915) ;; *) continue ;; esac
     busy=$(drm_busy "$pci")
   fi
 
@@ -833,6 +875,7 @@ fi
 jq -nc \
   --argjson cpu_pct "$(num "${CPU_PCT:-}" 0)" \
   --argjson cpu_cores "$CPU_CORES_JSON" \
+  --argjson cpu_core_of "$CORE_OF_JSON" \
   --argjson ncpu "$(num "${NCPU:-}" 1)" \
   --argjson load "[$(num "${LOAD1:-}" 0),$(num "${LOAD5:-}" 0),$(num "${LOAD15:-}" 0)]" \
   --argjson freq_mhz "$(num "${FREQ_MHZ:-}")" \
@@ -864,7 +907,8 @@ jq -nc \
   --argjson top_mem "$TOP_MEM_JSON" \
   --argjson full "$FULL" \
   '{
-    cpu_pct: $cpu_pct, cpu_cores: $cpu_cores, ncpu: $ncpu, load: $load,
+    cpu_pct: $cpu_pct, cpu_cores: $cpu_cores, cpu_core_of: $cpu_core_of,
+    ncpu: $ncpu, load: $load,
     freq_mhz: $freq_mhz, freq_max_mhz: $freq_max_mhz,
     cpu_model: (if $cpu_model == "" then null else $cpu_model end),
     cpu_topology: { cores: $cores_phys, threads: $threads, sockets: $sockets },

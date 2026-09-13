@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.grootaiinfinity.hwmon",
   "name": "Hardware Monitor",
-  "version": "1.4.1",
+  "version": "1.5.0",
   "author": "groot",
   "license": "MIT",
   "description": "Live CPU / temperature readout in the bar; click for a detailed system panel (CPU cores, memory, thermals, GPUs, disks, network, top processes, battery).",
@@ -20,7 +20,8 @@
     "allowMultiple": false,
     "defaultSection": "right",
     "defaults": {
-      "expanded": false
+      "expanded": false,
+      "cpuView": "cores"
     },
     "schema": [
       {
@@ -29,6 +30,17 @@
         "label": "Start expanded",
         "defaultValue": false,
         "description": "Show the memory / GPU / battery readouts in the bar too (also toggled at runtime with right-click or scroll)."
+      },
+      {
+        "key": "cpuView",
+        "type": "enum",
+        "label": "CPU grid",
+        "options": [
+          "cores",
+          "threads"
+        ],
+        "defaultValue": "cores",
+        "description": "Whether the grid under the CPU meter shows one block per physical core or one per thread (also switched in the panel itself)."
       }
     ]
   }
