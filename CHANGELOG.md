@@ -36,6 +36,13 @@ CPU grid.
 
 ### Changed
 
+- **The grid adapts to the machine it is on.** A four-core laptop and a
+  sixty-four-core workstation are the same widget, so the cells fit themselves
+  to the panel rather than the panel growing without end: as many labelled
+  cells as the width will carry, up to eight rows of them, and past that a slim
+  strip with each row's first number in the margin. Verified by rendering a
+  synthetic 64-core / 128-thread machine on a real bar — 128 threads come out as
+  seven short rows, and both views draw without a single QML error.
 - **The grid blocks are a third of the height and finally carry their number.**
   They were unlabelled vertical bars at `Style.space(40)`; each is now a
   horizontal fill at `Style.space(17)` with the core or thread number on the

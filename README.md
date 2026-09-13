@@ -25,7 +25,9 @@ about the plugin. The full list of what the panel shows is below.
   - System summary: machine model, CPU model, core / thread / socket count,
     distro, kernel, architecture
   - CPU usage, current / max frequency, load average, and a numbered grid of
-    per-core blocks — switchable to one block per thread, cores by default
+    per-core blocks — switchable to one block per thread, cores by default. The
+    grid sizes itself to the machine: labelled blocks while they fit, and a slim
+    numbered strip on a machine with too many cores to label them all
   - Memory and swap
   - Thermals and fan speeds (a stopped fan included, with its PWM duty cycle
     where the chip exposes one)

@@ -10,23 +10,29 @@ QML=$(dirname "$0")/../hwmon.qml
 TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
 
 python3 - "$QML" "$TMP/cells.js" <<'PY'
-import sys, re
+import sys
 src = open(sys.argv[1]).read()
-start = src.index('readonly property var cpuCells: {')
-body = src[src.index('{', start):]
-depth = 0
-for i, ch in enumerate(body):
-    if ch == '{': depth += 1
-    elif ch == '}':
-        depth -= 1
-        if depth == 0:
-            body = body[:i + 1]; break
-open(sys.argv[2], 'w').write(
-    "function cpuCells(root) " + body + "\nmodule.exports = cpuCells;\n")
+
+def braces(at):          # the { ... } block starting at or after `at`
+    body = src[src.index('{', at):]
+    depth = 0
+    for i, ch in enumerate(body):
+        if ch == '{': depth += 1
+        elif ch == '}':
+            depth -= 1
+            if depth == 0: return body[:i + 1]
+    raise SystemExit('unbalanced braces')
+
+out = ["function cpuCells(root) " + braces(src.index('readonly property var cpuCells: {'))]
+for name, sig in (('cpuLayout', 'n, width, gap, textCell, slimCell, labelW, maxTextRows'),
+                  ('cpuChunk', 'cells, columns')):
+    out.append("function %s(%s) %s" % (name, sig, braces(src.index('function %s(' % name))))
+out.append("module.exports = { cpuCells, cpuLayout, cpuChunk };")
+open(sys.argv[2], 'w').write("\n".join(out) + "\n")
 PY
 
 cat > "$TMP/run.cjs" <<'JS'
-const cpuCells = require(process.argv[2]);
+const { cpuCells, cpuLayout, cpuChunk } = require(process.argv[2]);
 const eq = (a, b) => JSON.stringify(a) === JSON.stringify(b);
 const cases = [];
 
@@ -61,6 +67,36 @@ cases.push(["empty before the first sample", cpuCells({ stats: {}, cpuView: "cor
 const odd = { stats: { cpu_cores: [1,2,3,4], cpu_core_of: [3,1,3,1] }, cpuView: "cores" };
 cases.push(["sorted by core number", cpuCells(odd).map(c => c.label).join(","), "1,3"]);
 
+// Layout on a 390px panel, the width this widget actually gets. Cells carry
+// their number until there are too many to fit, then the strip takes over.
+const W = 352, GAP = 4, TEXT = 58, SLIM = 13, LABEL = 22, ROWS = 8;
+const lay = n => cpuLayout(n, W, GAP, TEXT, SLIM, LABEL, ROWS);
+const rowsOf = n => Math.ceil(n / lay(n).columns);
+
+// Asserted as properties rather than exact grids: the numbers depend on the
+// panel's width and the theme's scale, but these have to hold on any of them.
+cases.push(["4 cores: a single labelled row",   [lay(4).compact, rowsOf(4)],   [false, 1]]);
+cases.push(["8 cores: evened into two rows",    [lay(8).compact, lay(8).columns, rowsOf(8)], [false, 4, 2]]);
+cases.push(["16 cores keep their numbers",      lay(16).compact,  false]);
+cases.push(["32 threads keep their numbers",    lay(32).compact,  false]);
+cases.push(["and stay within eight rows",       rowsOf(32) <= 8,  true]);
+cases.push(["64 cores switch to the strip",     lay(64).compact,  true]);
+cases.push(["128 threads too",                  lay(128).compact, true]);
+cases.push(["the strip stays short: 128",       rowsOf(128) <= 8, true]);
+cases.push(["the strip stays short: 256",       rowsOf(256) <= 16, true]);
+cases.push(["a strip row never gets absurd",    lay(256).columns <= 32, true]);
+cases.push(["nothing sampled yet is safe",      lay(0).columns, 1]);
+cases.push(["zero width is safe",               cpuLayout(64, 0, GAP, TEXT, SLIM, LABEL, ROWS).columns, 1]);
+cases.push(["a narrow panel still fits cells",  cpuLayout(16, 120, GAP, TEXT, SLIM, LABEL, ROWS).columns >= 1, true]);
+cases.push(["every cell is placed, 1..256",     [4,8,16,32,64,128,256].every(n => lay(n).columns * rowsOf(n) >= n), true]);
+
+// Rows carry the index they start at, so a strip stays readable.
+const cols = lay(64).columns;
+const rows = cpuChunk(Array.from({length: 64}, (_, i) => ({ label: String(i), pct: i })), cols);
+cases.push(["each row says where it starts",    rows.map(r => r.start).join(","), rows.map((_, i) => i * cols).join(",")]);
+cases.push(["no cell is dropped",               rows.reduce((n, r) => n + r.cells.length, 0), 64]);
+cases.push(["the last row holds the remainder", rows[rows.length - 1].cells.length, 64 - cols * (rows.length - 1)]);
+
 let bad = 0;
 for (const [name, got, want] of cases) {
   if (eq(got, want)) console.log("  ok   " + name);
@@ -69,5 +105,5 @@ for (const [name, got, want] of cases) {
 process.exit(bad ? 1 : 0);
 JS
 node "$TMP/run.cjs" "$TMP/cells.js"; rc=$?
-[ $rc = 0 ] && PASS=11 || FAIL=1
+[ $rc = 0 ] && PASS=28 || FAIL=1
 summary

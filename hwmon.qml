@@ -93,6 +93,37 @@ Panel {
     return out
   }
 
+  // A four-core laptop and a sixty-four-core workstation are the same widget,
+  // so the grid adapts instead of the panel growing without end: as many
+  // labelled cells as the width will carry - up to eight rows of them, which on
+  // this panel is a forty-thread machine - and past that a slim strip with the
+  // row's first number in the margin. Pure, so tests/test-cpuview.sh can drive
+  // it with plain numbers.
+  function cpuLayout(n, width, gap, textCell, slimCell, labelW, maxTextRows) {
+    if (n <= 0 || width <= 0) return { columns: 1, compact: false }
+    var textCols = Math.max(1, Math.floor((width + gap) / (textCell + gap)))
+    if (n <= textCols * maxTextRows) {
+      // Even out the rows: eight cells across six columns reads better as 4+4
+      // than as 6+2.
+      var rows = Math.ceil(n / textCols)
+      return { columns: Math.min(n, Math.max(1, Math.ceil(n / rows))), compact: false }
+    }
+    var avail = width - labelW - gap
+    return { columns: Math.max(1, Math.floor((avail + gap) / (slimCell + gap))), compact: true }
+  }
+
+  // The cells cut into rows, each carrying the index it starts at.
+  function cpuChunk(cells, columns) {
+    var rows = []
+    for (var i = 0; i < cells.length; i += columns)
+      rows.push({ start: i, cells: cells.slice(i, i + columns) })
+    return rows
+  }
+
+  readonly property var cpuGridLayout: root.cpuLayout(root.cpuCells.length, panelColumn.width,
+      Style.space(4), Style.space(58), Style.space(13), Style.space(22), 8)
+  readonly property var cpuRows: root.cpuChunk(root.cpuCells, root.cpuGridLayout.columns)
+
   readonly property int cpuPct: Math.round(Number(stats.cpu_pct) || 0)
   readonly property int memPct: Math.round(Number(stats.mem_pct) || 0)
   readonly property var tempC: (stats.temp_c === null || stats.temp_c === undefined) ? null : Math.round(stats.temp_c)
@@ -562,7 +593,7 @@ Panel {
           Item {
             width: parent.width
             visible: root.cpuCells.length > 0
-            implicitHeight: cpuGrid.y + cpuGrid.implicitHeight
+            implicitHeight: cpuGridBody.y + cpuGridBody.implicitHeight
 
             Row {
               id: cpuViewToggle
@@ -598,21 +629,53 @@ Panel {
               }
             }
 
-            Grid {
-              id: cpuGrid
+            Column {
+              id: cpuGridBody
               anchors.top: cpuViewToggle.bottom
               anchors.topMargin: Style.space(5)
               width: parent.width
-              columns: 4
-              columnSpacing: Style.space(4)
-              rowSpacing: Style.space(4)
+              spacing: Style.space(4)
+
+              readonly property real gap: Style.space(4)
+              readonly property real labelW: root.cpuGridLayout.compact ? Style.space(22) : 0
+              readonly property real cellW: {
+                var cols = Math.max(1, root.cpuGridLayout.columns)
+                var avail = width - (root.cpuGridLayout.compact ? labelW + gap : 0)
+                return Math.max(Style.space(6), (avail - gap * (cols - 1)) / cols)
+              }
+
               Repeater {
-                model: root.cpuCells
-                CoreCell {
+                model: root.cpuRows
+                Row {
+                  id: cpuRow
                   required property var modelData
-                  label: modelData.label
-                  pct: modelData.pct
-                  cellW: (cpuGrid.width - Style.space(4) * 3) / 4
+                  spacing: cpuGridBody.gap
+
+                  // Sixty-four cells cannot each carry a number, so the row says
+                  // where it starts and the cells stay in order across it.
+                  Text {
+                    visible: root.cpuGridLayout.compact
+                    width: visible ? cpuGridBody.labelW : 0
+                    height: cpuGridBody.cellW > 0 ? Style.space(12) : 0
+                    horizontalAlignment: Text.AlignRight
+                    verticalAlignment: Text.AlignVCenter
+                    textFormat: Text.PlainText
+                    text: cpuRow.modelData.start
+                    color: root.fg
+                    opacity: 0.45
+                    font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                    font.pixelSize: Style.font.caption
+                  }
+                  Repeater {
+                    model: cpuRow.modelData.cells
+                    CoreCell {
+                      required property var modelData
+                      label: modelData.label
+                      pct: modelData.pct
+                      cellW: cpuGridBody.cellW
+                      compact: root.cpuGridLayout.compact
+                    }
+                  }
                 }
               }
             }
@@ -989,10 +1052,11 @@ Panel {
     property string label: ""
     property real pct: 0
     property real cellW: 10
+    property bool compact: false      // too many to label: a slim fill instead
     readonly property real clamped: Math.max(0, Math.min(100, pct))
     width: cellW
-    height: Style.space(17)
-    implicitHeight: Style.space(17)
+    height: compact ? Style.space(12) : Style.space(17)
+    implicitHeight: height
 
     Rectangle {
       id: cellTrack
@@ -1013,6 +1077,7 @@ Panel {
       }
     }
     Text {
+      visible: !cell.compact
       anchors.left: cellTrack.left
       anchors.leftMargin: Style.space(5)
       anchors.verticalCenter: cellTrack.verticalCenter
@@ -1024,6 +1089,7 @@ Panel {
       font.pixelSize: Style.font.caption
     }
     Text {
+      visible: !cell.compact
       anchors.right: cellTrack.right
       anchors.rightMargin: Style.space(5)
       anchors.verticalCenter: cellTrack.verticalCenter
