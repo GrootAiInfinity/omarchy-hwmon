@@ -117,6 +117,9 @@ omarchy-shell io.github.grootaiinfinity.hwmon close
 omarchy-shell io.github.grootaiinfinity.hwmon expand           # bar readout
 omarchy-shell io.github.grootaiinfinity.hwmon collapse
 omarchy-shell io.github.grootaiinfinity.hwmon toggleExpanded
+omarchy-shell io.github.grootaiinfinity.hwmon cores             # CPU grid
+omarchy-shell io.github.grootaiinfinity.hwmon threads
+omarchy-shell io.github.grootaiinfinity.hwmon toggleCpuView
 ```
 
 The backend can also be run on its own — it prints one line of JSON:

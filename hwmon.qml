@@ -232,6 +232,11 @@ Panel {
     function expand(): void { root.setExpanded(true) }
     function collapse(): void { root.setExpanded(false) }
     function toggleExpanded(): void { root.setExpanded(!root.expanded) }
+
+    // CPU grid, same thing the Cores / Threads buttons above it do.
+    function cores(): void { root.setCpuView("cores") }
+    function threads(): void { root.setCpuView("threads") }
+    function toggleCpuView(): void { root.setCpuView(root.cpuView === "cores" ? "threads" : "cores") }
   }
 
   Component.onCompleted: {

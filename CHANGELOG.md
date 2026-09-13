@@ -30,8 +30,9 @@ CPU grid.
   SMT machine the thread view is twice the blocks for the same silicon, which
   is more noise than signal unless you are chasing one hot thread. The choice is
   the `cpuView` setting, saved like the bar readout's, and switched from the
-  panel with the Cores / Threads buttons above the grid. `stats` gained
-  `cpu_core_of`, which says which physical core each thread sits on.
+  panel with the Cores / Threads buttons above the grid, or over IPC with
+  `cores` / `threads` / `toggleCpuView`. `stats` gained `cpu_core_of`, which
+  says which physical core each thread sits on.
 
 ### Changed
 
